@@ -279,7 +279,7 @@
         </div>
 
         <input id="editTemplateName" placeholder="Template Name" />
-        <input id="editTemplateIssueTitle" placeholder="Issue Title" />
+        <input id="editTemplateIssueTitle" placeholder="Short Description" />
         <div class="template-edit-grid">
           <input id="editTemplateObject" placeholder="Object" />
           <input id="editTemplateDeviation" placeholder="Deviation" />
@@ -480,7 +480,7 @@
               <div id="incPanel" class="hidden">
                 <div class="template-panel">
                   <div class="template-title-row">
-                    <input id="issueTitle" placeholder="Issue Title" />
+                    <input id="issueTitle" placeholder="Short Description" />
                     <button
                       type="button"
                       class="template-save-btn"
@@ -2310,7 +2310,7 @@
         const troubleshooting = $("troubleshooting").value.trim();
 
         if (!issueTitle || !troubleshooting) {
-          // showMessage("Add issue title and TS notes first", "error");
+          // showMessage("Add Short Description and TS notes first", "error");
           return;
         }
 
@@ -2569,7 +2569,7 @@
 
         if (!name || !issueTitle || !troubleshooting) {
           // showMessage(
-          //   "Template name, issue title, and TS notes are required",
+          //   "Template name, Short Description, and TS notes are required",
           //   "error",
           // );
           return;
@@ -5428,29 +5428,29 @@
       const themes = [
         { id: "dark-pro", name: "Dark Pro" },
         { id: "light-clean", name: "Light" },
-        { id: "glass", name: "Glass" },
-        { id: "neon", name: "Neon" },
-        { id: "purple", name: "Purple" },
-        { id: "emerald", name: "Emerald" },
-        { id: "mono", name: "Mono" },
-        { id: "midnight-red", name: "Red" },
-        { id: "ocean", name: "Ocean" },
-        { id: "sunset", name: "Sunset" },
-        { id: "rose-gold", name: "Rose Gold" },
-        { id: "arctic", name: "Arctic" },
-        { id: "matrix", name: "Matrix" },
-        { id: "dracula", name: "Dracula" },
-        { id: "github-dark", name: "GitHub" },
-        { id: "cyberpunk", name: "Cyberpunk" },
-        { id: "terminal", name: "Terminal" },
-        { id: "royal-gold", name: "Royal Gold" },
-        { id: "nord", name: "Nord" },
-        { id: "slate-mint", name: "Slate Mint" },
-        { id: "cobalt", name: "Cobalt" },
-        { id: "ruby-night", name: "Ruby Night" },
-        { id: "graphite", name: "Graphite" },
-        { id: "solar", name: "Solar" },
-        { id: "orchid", name: "Orchid" },
+        // { id: "glass", name: "Glass" },
+        // { id: "neon", name: "Neon" },
+        // { id: "purple", name: "Purple" },
+        // { id: "emerald", name: "Emerald" },
+        // { id: "mono", name: "Mono" },
+        // { id: "midnight-red", name: "Red" },
+        // { id: "ocean", name: "Ocean" },
+        // { id: "sunset", name: "Sunset" },
+        // { id: "rose-gold", name: "Rose Gold" },
+        // { id: "arctic", name: "Arctic" },
+        // { id: "matrix", name: "Matrix" },
+        // { id: "dracula", name: "Dracula" },
+        // { id: "github-dark", name: "GitHub" },
+        // { id: "cyberpunk", name: "Cyberpunk" },
+        // { id: "terminal", name: "Terminal" },
+        // { id: "royal-gold", name: "Royal Gold" },
+        // { id: "nord", name: "Nord" },
+        // { id: "slate-mint", name: "Slate Mint" },
+        // { id: "cobalt", name: "Cobalt" },
+        // { id: "ruby-night", name: "Ruby Night" },
+        // { id: "graphite", name: "Graphite" },
+        // { id: "solar", name: "Solar" },
+        // { id: "orchid", name: "Orchid" },
       ];
       function setTheme(theme) {
         document.documentElement.setAttribute("data-theme", theme);
