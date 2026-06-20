@@ -131,7 +131,7 @@
       >
         <i class="fa-solid fa-arrow-up"></i>
       </button> -->
-    <button
+      <button
         type="button"
         class="fab"
         onclick="newTicket(this)"
@@ -726,7 +726,8 @@
    GLOBALS & CONSTANTS
    ========================================================== */
       let db = null,
-        currentTicket = null,loadedTicketId = null;
+        currentTicket = null,
+        loadedTicketId = null;
       let editingTemplateId = null;
       let autoSaveTimer;
       const $ = (id) => document.getElementById(id);
@@ -1972,6 +1973,10 @@
           showMessage("Database is not ready yet", "error");
           return;
         }
+        if (!window.showSaveFilePicker) {
+          showMessage("Your browser does not support File System API", "error");
+          return;
+        }
 
         try {
           const backup = {
@@ -1993,19 +1998,37 @@
             },
           };
 
-          const blob = new Blob([JSON.stringify(backup, null, 2)], {
-            type: "application/json",
-          });
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          const stamp = new Date().toISOString().slice(0, 10);
+          // const blob = new Blob([JSON.stringify(backup, null, 2)], {
+          //   type: "application/json",
+          // });
+          // const url = URL.createObjectURL(blob);
+          // const link = document.createElement("a");
+          // const stamp = new Date().toISOString().slice(0, 10);
 
-          link.href = url;
-          link.download = `ticketpad-backup-${stamp}.json`;
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
-          URL.revokeObjectURL(url);
+          // link.href = url;
+          // link.download = `ticketpad-backup-${stamp}.json`;
+          // document.body.appendChild(link);
+          // link.click();
+          // link.remove();
+          // URL.revokeObjectURL(url);
+
+          const handle = await window.showSaveFilePicker({
+            suggestedName: `ticketpad-backup.json`,
+            types: [
+              {
+                description: "JSON Backup",
+                accept: {
+                  "application/json": [".json"],
+                },
+              },
+            ],
+          });
+
+          const writable = await handle.createWritable();
+
+          await writable.write(JSON.stringify(backup, null, 2));
+
+          await writable.close();
 
           showMessage("IndexedDB backup exported", "success");
         } catch (error) {
@@ -2292,11 +2315,7 @@
         }
 
         const env = getTemplateEnvironment();
-        const defaultName = [
-          issueTitle
-        ]
-          .filter(Boolean)
-          .join(" - ");
+        const defaultName = [issueTitle].filter(Boolean).join(" - ");
         const name = prompt("Template name", defaultName);
 
         if (!name || !name.trim()) return;
