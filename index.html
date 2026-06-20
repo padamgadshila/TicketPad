@@ -135,7 +135,8 @@
         type="button"
         class="fab"
         onclick="newTicket(this)"
-        title="New Ticket"
+        title="Pin and create related ticket"
+        aria-label="Pin and create related ticket"
       >
         <i class="fa-solid fa-clone"></i>
       </button>
@@ -1858,23 +1859,32 @@
         };
       }
 
+      async function putTicketRecord(data) {
+        if (!db) return;
+
+        const encryptedData = await encryptRecord(data);
+
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(["tickets"], "readwrite");
+          tx.objectStore("tickets").put(encryptedData);
+          tx.oncomplete = resolve;
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      }
+
       async function persistTicket(data, callback) {
         if (!db) return;
 
         currentTicket = data;
-        const encryptedData = await encryptRecord(data);
+        await putTicketRecord(data);
 
-        const tx = db.transaction(["tickets"], "readwrite");
-        tx.objectStore("tickets").put(encryptedData);
+        $("incTab").classList.remove("disabled");
+        updatePreview();
+        loadTickets();
+        loadPinnedTickets();
 
-        tx.oncomplete = () => {
-          $("incTab").classList.remove("disabled");
-          updatePreview();
-          loadTickets();
-          loadPinnedTickets();
-
-          if (callback) callback();
-        };
+        if (callback) callback();
       }
 
       function getObjectStoreRecords(storeName) {
@@ -4864,77 +4874,93 @@
         menu.classList.remove("hidden");
       }
 
-      function newTicket(btn){
-        // Save current form data
+      function isValidTicketId(ticketId) {
+        return /^(IMS|INC)\d+$/i.test(String(ticketId || "").trim());
+      }
+
+      async function newTicket(btn) {
+        if (!db) return;
+
+        const ticketId = $("ticketId").value.trim().toUpperCase();
+        if (!isValidTicketId(ticketId)) {
+          return showMessage("Enter valid ticket ID first", "error");
+        }
+
         const currentData = buildTicketData();
-        //Pin the current one
-        toggleCurrentTicketPin(btn)
-        
-        // new ticket creation
-        createNewTicket(currentData)
+        currentData.pinned = true;
+        await persistTicket(currentData);
 
-        // Add new ticket
+        const draftTicket = createRelatedTicketDraft(currentData);
+        await persistTicket(draftTicket, () => {
+          animateButtonSuccess(btn, '<i class="fa-solid fa-check"></i>');
+          showMessage(
+            "Pinned current ticket and started a related ticket.",
+            "success",
+          );
+        });
+        loadTicket(draftTicket);
       }
-      function createNewTicket(data){
-        clearIMSForm()
-        const draftId = `DRAFT-${Date.now()}`;
 
-            $("userId").value = data.userId || "",
-            $("fullName").value = data.fullName || "";
-            $("contact").value = data.contact || "";
-            $("userType").value = data.userType || "";
-            $("workingHours").value = data.workingHours || "";
-            $("os").value = data.os || "";
-            $("deviceType").value = data.deviceType || "";
-            $("workstationId").value = data.workstationId || "";
-            $("object").value =  "";
-            $("deviation").value =  "";
-            $("lastAttempt").value =  "";
-            $("priorIssue").value = "New";
-            $("priorTicketNumber").value =  "";
-            $("multiuser").value = data.multiuser || "";
+      function createRelatedTicketDraft(data) {
+        const now = new Date().toISOString();
+        const ims = data.ims || {};
 
-          updateFilledFieldHighlights();
-          updatePreview();
-          persistTicket(buildTicketData());
+        return {
+          id: `DRAFT-${Date.now()}`,
+          ims: {
+            ...ims,
+            object: "",
+            deviation: "",
+          },
+          resolution: {},
+          inc: {
+            validationRef: data.inc?.validationRef || "",
+            ticketStatus: "Resolved",
+          },
+          createdAt: now,
+          updatedAt: now,
+          pinned: true,
+        };
       }
-$("ticketId").addEventListener("blur", handleDraftConversion);
-async function handleDraftConversion() {
 
-    const newTicketId = $("ticketId").value.trim().toUpperCase();
+      $("ticketId").addEventListener("blur", handleDraftConversion);
 
-    if (!/^(IMS|INC)\d+$/.test(newTicketId)) {
-        return;
-    }
+      async function handleDraftConversion() {
+        const newTicketId = $("ticketId").value.trim().toUpperCase();
 
-    if (!currentTicket?.id?.startsWith("DRAFT-")) {
-        return;
-    }
+        if (!isValidTicketId(newTicketId)) {
+          return;
+        }
 
-    const oldDraftId = currentTicket.id;
+        if (!currentTicket?.id?.startsWith("DRAFT-")) {
+          return;
+        }
 
-    const updatedTicket = buildTicketData();
-    updatedTicket.id = newTicketId;
+        const oldDraftId = currentTicket.id;
+        const updatedTicket = buildTicketData();
+        updatedTicket.id = newTicketId;
 
-    const tx = db.transaction(["tickets"], "readwrite");
-    const store = tx.objectStore("tickets");
+        const tx = db.transaction(["tickets"], "readwrite");
+        const store = tx.objectStore("tickets");
 
-    store.delete(oldDraftId);
+        store.delete(oldDraftId);
 
-    const encrypted = await encryptRecord(updatedTicket);
-    store.put(encrypted);
+        const encrypted = await encryptRecord(updatedTicket);
+        store.put(encrypted);
 
-    currentTicket = updatedTicket;
+        currentTicket = updatedTicket;
 
-    tx.oncomplete = () => {
-        loadTickets();
-        loadPinnedTickets();
-    };
-}
+        tx.oncomplete = () => {
+          loadTickets();
+          loadPinnedTickets();
+          updatePinCurrentTicketButton();
+        };
+      }
+
       function toggleCurrentTicketPin(btn) {
         const ticketId = $("ticketId").value.trim().toUpperCase();
 
-        if (!/^(IMS|INC)\d+$/i.test(ticketId)) {
+        if (!isValidTicketId(ticketId)) {
           return showMessage("Enter valid ticket ID first", "error");
         }
 
@@ -5203,7 +5229,9 @@ async function handleDraftConversion() {
         currentTicket = t;
         const i = t.ims || {},
           inc = t.inc || {};
-        $("ticketId").value = t.id || "";
+        $("ticketId").value = String(t.id || "").startsWith("DRAFT-")
+          ? ""
+          : t.id || "";
         $("userId").value = i.userId || "";
         $("fullName").value = i.fullName || "";
         $("contact").value = i.contact || "";
