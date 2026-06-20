@@ -726,7 +726,7 @@
    GLOBALS & CONSTANTS
    ========================================================== */
       let db = null,
-        currentTicket = null;
+        currentTicket = null,loadedTicketId = null;
       let editingTemplateId = null;
       let autoSaveTimer;
       const $ = (id) => document.getElementById(id);
@@ -4915,7 +4915,7 @@
           resolution: {},
           inc: {
             validationRef: data.inc?.validationRef || "",
-            ticketStatus: "Resolved",
+            ticketStatus: "Set Ticket Status",
           },
           createdAt: now,
           updatedAt: now,
@@ -4932,11 +4932,11 @@
           return;
         }
 
-        if (!currentTicket?.id?.startsWith("DRAFT-")) {
+        if (!loadedTicketId?.startsWith("DRAFT-")) {
           return;
         }
 
-        const oldDraftId = currentTicket.id;
+        const oldDraftId = loadedTicketId;
         const updatedTicket = buildTicketData();
         updatedTicket.id = newTicketId;
 
@@ -4949,6 +4949,7 @@
         store.put(encrypted);
 
         currentTicket = updatedTicket;
+        loadedTicketId = updatedTicket.id;
 
         tx.oncomplete = () => {
           loadTickets();
@@ -5227,6 +5228,7 @@
 
       function loadTicket(t) {
         currentTicket = t;
+        loadedTicketId = t.id;
         const i = t.ims || {},
           inc = t.inc || {};
         $("ticketId").value = String(t.id || "").startsWith("DRAFT-")
