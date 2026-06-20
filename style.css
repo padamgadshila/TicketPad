@@ -125,7 +125,7 @@
   --bg-card: #0d2742;
   --bg-input: #0a2138;
   --bg-elevated: #13314f;
-  --text-main: #dbeafe;
+  --text-main: var(--text-main);
   --text-muted: #93c5fd;
   --text-strong: #fff;
   --border: #1d4ed8;
@@ -1269,7 +1269,6 @@ body.has-pinned-tickets .pinned-ticket-drawer {
   border-radius: 8px;
 }
 
-.ticketpad-password-hint,
 .ticketpad-lock-status,
 .security-auto-lock {
   margin-top: 12px;
@@ -1329,7 +1328,10 @@ body.has-pinned-tickets .pinned-ticket-drawer {
   background: var(--bg-card);
   color: var(--text-main);
   box-shadow: var(--shadow);
-  transition: opacity 0.2s ease, transform 0.2s ease, visibility 0.2s ease;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease,
+    visibility 0.2s ease;
 }
 
 .security-menu.collapsed {
@@ -1632,6 +1634,9 @@ textarea {
   color: var(--text-strong);
   font-size: 14px;
 }
+h3 {
+  text-align: center;
+}
 h3,
 h4 {
   color: var(--text-strong);
@@ -1675,11 +1680,60 @@ h5 {
 .template-suggestions {
   display: grid;
   gap: 8px;
-  max-height: 140px;
+  max-height: 156px;
   overflow-y: auto;
   padding-right: 4px;
   overscroll-behavior: contain;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y;
   border-radius: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-muted) 58%, var(--border))
+    color-mix(in srgb, var(--bg-input) 88%, var(--border));
+}
+.template-suggestions::-webkit-scrollbar {
+  width: 11px;
+}
+.template-suggestions::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--bg-input) 88%, var(--border));
+  border-left: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--bg-main) 70%, transparent);
+}
+.template-suggestions::-webkit-scrollbar-thumb {
+  min-height: 38px;
+  background: color-mix(in srgb, var(--text-muted) 58%, var(--border));
+  border-radius: 999px;
+  border: 3px solid color-mix(in srgb, var(--bg-input) 88%, var(--border));
+}
+.template-suggestions::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-main) 68%, var(--border));
+}
+.template-suggestions::-webkit-scrollbar-button:single-button {
+  display: block;
+  width: 11px;
+  height: 14px;
+  background-color: color-mix(in srgb, var(--bg-input) 88%, var(--border));
+  border-left: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-right: 1px solid color-mix(in srgb, var(--bg-main) 70%, transparent);
+}
+.template-suggestions::-webkit-scrollbar-button:single-button:vertical:decrement {
+  background:
+    linear-gradient(135deg, transparent 50%, var(--text-main) 50%) 3px 6px / 4px
+      4px no-repeat,
+    linear-gradient(225deg, transparent 50%, var(--text-main) 50%) 6px 6px / 4px
+      4px no-repeat,
+    color-mix(in srgb, var(--bg-input) 88%, var(--border));
+}
+.template-suggestions::-webkit-scrollbar-button:single-button:vertical:increment {
+  background:
+    linear-gradient(45deg, transparent 50%, var(--text-main) 50%) 3px 4px / 4px
+      4px no-repeat,
+    linear-gradient(315deg, transparent 50%, var(--text-main) 50%) 6px 4px / 4px
+      4px no-repeat,
+    color-mix(in srgb, var(--bg-input) 88%, var(--border));
+}
+.template-suggestions::-webkit-scrollbar-button:single-button:hover {
+  background-color: color-mix(in srgb, var(--bg-elevated) 70%, var(--border));
 }
 .template-suggestion {
   width: 100%;
@@ -1910,7 +1964,7 @@ h5 {
 
 .encryption-change-btn {
   position: fixed;
-  bottom: 186px;
+  bottom: 90px;
   left: -20px;
   width: 58px;
   height: 58px;
@@ -1960,4 +2014,3 @@ h5 {
 #busyFields h4 {
   margin-bottom: 10px;
 }
-

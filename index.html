@@ -22,10 +22,6 @@
             </p>
           </div>
         </div>
-        <div
-          id="ticketpadPasswordHint"
-          class="ticketpad-password-hint hidden"
-        ></div>
         <input
           id="ticketpadPasswordInput"
           type="password"
@@ -39,25 +35,20 @@
           class="hidden"
           placeholder="Confirm password"
         />
-        <input
-          id="ticketpadPasswordHintInput"
-          class="hidden"
-          placeholder="Password hint (optional)"
-        />
         <div class="ticketpad-lock-actions">
           <button type="button" id="ticketpadUnlockBtn">
             <i class="fa-solid fa-unlock"></i>
             <span>Unlock</span>
           </button>
-          <button type="button" id="ticketpadImportRecoveryBtn">
+          <button type="button" id="ticketpadRestoreBackupBtn">
             <i class="fa-solid fa-file-import"></i>
-            <span>Recovery Key</span>
+            <span>Restore Backup</span>
           </button>
         </div>
         <input
-          id="ticketpadRecoveryImportFile"
+          id="ticketpadRestoreBackupFile"
           type="file"
-          accept=".txt,text/plain"
+          accept="application/json,.json"
           class="hidden"
         />
         <div id="ticketpadLockStatus" class="ticketpad-lock-status"></div>
@@ -72,18 +63,6 @@
       <button type="button" id="securityChangePasswordBtn">
         <i class="fa-solid fa-key"></i>
         <span>Change Password</span>
-      </button>
-      <button type="button" id="securityPasswordHintBtn">
-        <i class="fa-solid fa-lightbulb"></i>
-        <span>Password Hint</span>
-      </button>
-      <button type="button" id="securityExportRecoveryBtn">
-        <i class="fa-solid fa-file-export"></i>
-        <span>Export Recovery Key</span>
-      </button>
-      <button type="button" id="securityImportRecoveryBtn">
-        <i class="fa-solid fa-file-import"></i>
-        <span>Import Recovery Key</span>
       </button>
       <button type="button" id="securityLockNowBtn">
         <i class="fa-solid fa-lock"></i>
@@ -103,9 +82,7 @@
             <i id="securityModalIcon" class="fa-solid fa-shield-halved"></i>
             <div>
               <h2 id="securityModalTitle">TicketPad Security</h2>
-              <p id="securityModalSubtitle">
-                Manage password and recovery options.
-              </p>
+              <p id="securityModalSubtitle">Manage password options.</p>
             </div>
           </div>
           <button
@@ -884,10 +861,6 @@
         marker: "__ticketpadEncrypted",
         version: 1,
         saltKey: "ticketpad-encryption-salt",
-        hintKey: "ticketpad-password-hint",
-        recoveryKey: "ticketpad-recovery-wrapper",
-
-        recoveryCreatedKey: "ticketpad-recovery-created-at",
         iterations: 250000,
         autoLockMs: 30 * 60 * 1000,
       };
@@ -897,6 +870,7 @@
       let pendingUnlockResolve = null;
       let isCreatingVault = false;
       let autoLockTimer = null;
+      const settingsCache = {};
 
       function bytesToBase64(bytes) {
         const array = new Uint8Array(bytes);
@@ -938,21 +912,46 @@
         );
       }
 
-      function getDataSalt() {
-        return localStorage.getItem(DATA_CRYPTO_CONFIG.saltKey);
+      function isRetainedSettingKey(key) {
+        return ![
+          "ticketpad-password-hint",
+          "ticketpad-recovery-wrapper",
+          "ticketpad-recovery-created-at",
+        ].includes(key);
       }
 
-      function persistDataSaltToDatabase(salt) {
+      function getSetting(key, fallback = "") {
+        return Object.prototype.hasOwnProperty.call(settingsCache, key)
+          ? settingsCache[key]
+          : fallback;
+      }
+
+      function settingsRecordsToMap(records = []) {
+        return records.reduce((map, record) => {
+          if (record?.key && isRetainedSettingKey(record.key))
+            map[record.key] = record.value;
+          return map;
+        }, {});
+      }
+
+      async function loadSettingsCache() {
+        const records = await getRawObjectStoreRecords(SETTINGS_STORE);
+        Object.keys(settingsCache).forEach((key) => delete settingsCache[key]);
+        Object.assign(settingsCache, settingsRecordsToMap(records));
+        await migrateLegacyLocalStorageSettings();
+      }
+
+      function writeSettingRecord(key, value) {
         return new Promise((resolve, reject) => {
-          if (!db || !db.objectStoreNames.contains(SETTINGS_STORE) || !salt) {
+          if (!db || !db.objectStoreNames.contains(SETTINGS_STORE)) {
             resolve();
             return;
           }
 
           const tx = db.transaction([SETTINGS_STORE], "readwrite");
           tx.objectStore(SETTINGS_STORE).put({
-            key: DATA_CRYPTO_CONFIG.saltKey,
-            value: salt,
+            key,
+            value,
             updatedAt: new Date().toISOString(),
           });
 
@@ -962,111 +961,64 @@
         });
       }
 
-      async function restoreDataSaltFromDatabase() {
-        const localSalt = getDataSalt();
-        if (!db || !db.objectStoreNames.contains(SETTINGS_STORE)) return;
-
-        const storedSalt = await new Promise((resolve, reject) => {
-          const tx = db.transaction([SETTINGS_STORE], "readonly");
-          const req = tx
-            .objectStore(SETTINGS_STORE)
-            .get(DATA_CRYPTO_CONFIG.saltKey);
-
-          req.onsuccess = () => resolve(req.result?.value || "");
-          req.onerror = () => reject(req.error);
-        });
-
-        if (!localSalt && storedSalt) {
-          localStorage.setItem(DATA_CRYPTO_CONFIG.saltKey, storedSalt);
-          return;
-        }
-
-        if (localSalt && localSalt !== storedSalt) {
-          await persistDataSaltToDatabase(localSalt);
-        }
+      async function setSetting(key, value) {
+        settingsCache[key] = value;
+        await writeSettingRecord(key, value);
       }
 
-      function ensureDataSalt() {
+      async function deleteSetting(key) {
+        delete settingsCache[key];
+        await new Promise((resolve, reject) => {
+          if (!db || !db.objectStoreNames.contains(SETTINGS_STORE)) {
+            resolve();
+            return;
+          }
+
+          const tx = db.transaction([SETTINGS_STORE], "readwrite");
+          tx.objectStore(SETTINGS_STORE).delete(key);
+          tx.oncomplete = resolve;
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      }
+
+      async function migrateLegacyLocalStorageSettings() {
+        const legacyKeys = [DATA_CRYPTO_CONFIG.saltKey, "app-theme"];
+
+        for (const key of legacyKeys) {
+          const legacyValue = localStorage.getItem(key);
+          if (legacyValue && !getSetting(key)) {
+            await setSetting(key, legacyValue);
+          }
+          localStorage.removeItem(key);
+        }
+
+        localStorage.removeItem("ticketpad-password-hint");
+        localStorage.removeItem("ticketpad-recovery-wrapper");
+        localStorage.removeItem("ticketpad-recovery-created-at");
+        await deleteSetting("ticketpad-password-hint");
+        await deleteSetting("ticketpad-recovery-wrapper");
+        await deleteSetting("ticketpad-recovery-created-at");
+      }
+
+      function getDataSalt() {
+        return getSetting(DATA_CRYPTO_CONFIG.saltKey, "");
+      }
+
+      function persistDataSaltToDatabase(salt) {
+        return salt
+          ? setSetting(DATA_CRYPTO_CONFIG.saltKey, salt)
+          : Promise.resolve();
+      }
+
+      async function ensureDataSalt() {
         let salt = getDataSalt();
         if (!salt) {
           const newSalt = crypto.getRandomValues(new Uint8Array(16));
           salt = bytesToBase64(newSalt);
-          localStorage.setItem(DATA_CRYPTO_CONFIG.saltKey, salt);
-          persistDataSaltToDatabase(salt).catch(console.error);
+          await setSetting(DATA_CRYPTO_CONFIG.saltKey, salt);
         }
         return salt;
-      }
-
-      function normalizeRecoveryKey(value) {
-        return String(value || "")
-          .trim()
-          .toUpperCase()
-          .replace(/[^A-Z0-9]/g, "");
-      }
-
-      function formatRecoveryKey(raw) {
-        const clean = normalizeRecoveryKey(raw);
-        return [
-          "TPD",
-          clean.slice(3, 7),
-          clean.slice(7, 11),
-          clean.slice(11, 15),
-          clean.slice(15, 19),
-        ]
-          .filter(Boolean)
-          .join("-");
-      }
-
-      function createRecoveryKey() {
-        const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-        const bytes = crypto.getRandomValues(new Uint8Array(16));
-        let body = "";
-
-        for (const byte of bytes) {
-          body += alphabet[byte % alphabet.length];
-        }
-
-        return formatRecoveryKey("TPD" + body);
-      }
-
-      // function getStoredRecoveryKey() {
-      //   const stored = localStorage.getItem(DATA_CRYPTO_CONFIG.recoveryPlainKey);
-      //   return stored ? formatRecoveryKey(stored) : "";
-      // }
-
-      // function setStoredRecoveryKey(recoveryKey, createdAt = new Date().toISOString()) {
-      //   localStorage.setItem(
-      //     DATA_CRYPTO_CONFIG.recoveryPlainKey,
-      //     formatRecoveryKey(recoveryKey),
-      //   );
-      //   localStorage.setItem(DATA_CRYPTO_CONFIG.recoveryCreatedKey, createdAt);
-      // }
-
-      function getRecoveryCreatedAt() {
-        return (
-          localStorage.getItem(DATA_CRYPTO_CONFIG.recoveryCreatedKey) ||
-          getRecoveryWrapper()?.createdAt ||
-          new Date().toISOString()
-        );
-      }
-
-      function recoveryFileText(
-        recoveryKey,
-        createdAt = getRecoveryCreatedAt(),
-      ) {
-        const createdDate = new Date(createdAt).toISOString().slice(0, 10);
-        return [
-          "TicketPad Recovery Key",
-          "",
-          "Created:",
-          createdDate,
-          "",
-          "Recovery Key:",
-          formatRecoveryKey(recoveryKey),
-          "",
-          "Keep this safe.",
-          "Anyone with this key can unlock your data.",
-        ].join("\n");
       }
 
       function downloadTextFile(filename, text) {
@@ -1080,89 +1032,6 @@
         link.remove();
         URL.revokeObjectURL(url);
       }
-
-      function extractRecoveryKey(text) {
-        const match = String(text || "").match(
-          /(TPD[-\s]?[A-Z0-9]{4}[-\s]?[A-Z0-9]{4}[-\s]?[A-Z0-9]{4}[-\s]?[A-Z0-9]{4}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
-        );
-        return match ? formatRecoveryKey(match[1]) : "";
-      }
-
-      async function encryptTextWithPassphrase(text, passphrase, salt) {
-        const key = await deriveDataCryptoKey(passphrase, base64ToBytes(salt));
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        const encrypted = await crypto.subtle.encrypt(
-          { name: "AES-GCM", iv },
-          key,
-          new TextEncoder().encode(text),
-        );
-
-        return {
-          iv: bytesToBase64(iv),
-          data: bytesToBase64(encrypted),
-        };
-      }
-
-      async function decryptTextWithPassphrase(payload, passphrase, salt) {
-        const key = await deriveDataCryptoKey(passphrase, base64ToBytes(salt));
-        const decrypted = await crypto.subtle.decrypt(
-          { name: "AES-GCM", iv: base64ToBytes(payload.iv) },
-          key,
-          base64ToBytes(payload.data),
-        );
-
-        return new TextDecoder().decode(decrypted);
-      }
-
-      async function createRecoveryWrapper(
-        recoveryKey,
-        passphrase,
-        salt = getDataSalt(),
-      ) {
-        const encrypted = await encryptTextWithPassphrase(
-          passphrase,
-          normalizeRecoveryKey(recoveryKey),
-          salt,
-        );
-
-        return {
-          v: 1,
-          createdAt: new Date().toISOString(),
-          ...encrypted,
-        };
-      }
-
-      function getRecoveryWrapper() {
-        try {
-          return JSON.parse(
-            localStorage.getItem(DATA_CRYPTO_CONFIG.recoveryKey) || "null",
-          );
-        } catch {
-          return null;
-        }
-      }
-
-      async function saveRecoveryWrapper(
-        recoveryKey,
-        passphrase,
-        createdAt = new Date().toISOString(),
-      ) {
-        const wrapper = await createRecoveryWrapper(recoveryKey, passphrase);
-        wrapper.createdAt = createdAt;
-        localStorage.setItem(
-          DATA_CRYPTO_CONFIG.recoveryKey,
-          JSON.stringify(wrapper),
-        );
-        localStorage.setItem(DATA_CRYPTO_CONFIG.recoveryCreatedKey, createdAt);
-        return wrapper;
-      }
-
-      async function ensureRecoveryKeyForActiveVault() {
-        throw new Error(
-          "Recovery keys are only available when generated. Generate a new recovery key instead.",
-        );
-      }
-
       function escapeHtml(value) {
         return String(value ?? "")
           .replace(/&/g, "&amp;")
@@ -1245,165 +1114,6 @@
         );
       }
 
-      function showRecoveryKeyPanel(
-        recoveryKey,
-        createdAt = getRecoveryCreatedAt(),
-      ) {
-        openSecurityModal({
-          title: "Recovery Key",
-          subtitle:
-            "Save this key. It can unlock TicketPad if you forget your password.",
-          icon: "fa-solid fa-file-shield",
-          body: `
-            <div class="security-warning">
-              <i class="fa-solid fa-triangle-exclamation"></i>
-              <span>Anyone with this key can unlock your data.</span>
-            </div>
-            <div class="security-recovery-key">${escapeHtml(formatRecoveryKey(recoveryKey))}</div>
-            <div class="security-recovery-file">
-              <span>File: TicketPad-Recovery-Key.txt</span>
-              <button type="button" id="securityDownloadRecoveryBtn">
-                <i class="fa-solid fa-download"></i>
-                <span>Download File</span>
-              </button>
-            </div>
-          `,
-          onSubmit: null,
-          cancelText: "Done",
-          afterRender: () => {
-            $("securityDownloadRecoveryBtn")?.addEventListener("click", () => {
-              downloadTextFile(
-                "TicketPad-Recovery-Key.txt",
-                recoveryFileText(recoveryKey, createdAt),
-              );
-              setSecurityModalStatus(
-                "Recovery key file downloaded.",
-                "success",
-              );
-            });
-          },
-        });
-      }
-
-      async function exportRecoveryKey() {
-        if (!activePassphrase) {
-          showMessage("Unlock TicketPad first", "error");
-          return;
-        }
-
-        const shouldGenerate = confirm(
-          "Generate a new recovery key?\n\nThis will replace any previous recovery key.",
-        );
-
-        if (!shouldGenerate) return;
-
-        const recoveryKey = createRecoveryKey();
-
-        await saveRecoveryWrapper(recoveryKey, activePassphrase);
-
-        showRecoveryKeyPanel(recoveryKey);
-      }
-
-      async function acceptRecoveryKey(recoveryKey) {
-        const cleanKey =
-          extractRecoveryKey(recoveryKey) || formatRecoveryKey(recoveryKey);
-
-        if (!normalizeRecoveryKey(cleanKey)) {
-          throw new Error("No recovery key was found.");
-        }
-
-        await unlockWithRecoveryKey(cleanKey);
-
-        loadTickets();
-        loadPinnedTickets();
-        loadTemplates();
-        updateTemplateSuggestions();
-
-        showMessage("Recovery key accepted", "success");
-      }
-
-      async function importRecoveryKeyFromText(text) {
-        try {
-          await acceptRecoveryKey(text);
-          closeSecurityModal();
-        } catch (error) {
-          console.error(error);
-          setLockStatus(error.message || "Recovery key import failed", "error");
-          setSecurityModalStatus(
-            error.message || "Recovery key import failed",
-            "error",
-          );
-          showMessage(error.message || "Recovery key import failed", "error");
-        }
-      }
-
-      function requestRecoveryKeyImport() {
-        openSecurityModal({
-          title: "Import Recovery Key",
-          subtitle: "Paste the key or choose TicketPad-Recovery-Key.txt.",
-          icon: "fa-solid fa-file-import",
-          body: `
-            <label class="security-field">
-              <span>Recovery Key</span>
-              <textarea name="recoveryKey" rows="5" placeholder="TPD-RK4A-9XK8-MP22-FN71"></textarea>
-            </label>
-            <button type="button" id="securityChooseRecoveryFileBtn" class="security-secondary-btn security-wide-btn">
-              <i class="fa-solid fa-folder-open"></i>
-              <span>Choose Recovery File</span>
-            </button>
-          `,
-          submitText: "Unlock",
-          submitIcon: "fa-solid fa-unlock",
-          onSubmit: async (formData) => {
-            const keyText = String(formData.get("recoveryKey") || "").trim();
-            if (!keyText)
-              throw new Error(
-                "Paste a recovery key or choose the recovery file.",
-              );
-            await acceptRecoveryKey(keyText);
-            closeSecurityModal();
-          },
-          afterRender: () => {
-            $("securityChooseRecoveryFileBtn")?.addEventListener(
-              "click",
-              () => {
-                $("ticketpadRecoveryImportFile")?.click();
-              },
-            );
-          },
-        });
-      }
-
-      async function updatePasswordHint() {
-        const currentHint =
-          localStorage.getItem(DATA_CRYPTO_CONFIG.hintKey) || "";
-        openSecurityModal({
-          title: "Password Hint",
-          subtitle:
-            "Use a hint that helps you, but does not reveal the password.",
-          icon: "fa-solid fa-lightbulb",
-          body: `
-            <label class="security-field">
-              <span>Password Hint</span>
-              <input name="hint" value="${escapeHtml(currentHint)}" placeholder="Example: old work laptop phrase" />
-            </label>
-          `,
-          submitText: "Save Hint",
-          submitIcon: "fa-solid fa-lightbulb",
-          onSubmit: async (formData) => {
-            const hint = String(formData.get("hint") || "").trim();
-            if (hint) {
-              localStorage.setItem(DATA_CRYPTO_CONFIG.hintKey, hint);
-              showMessage("Password hint saved", "success");
-            } else {
-              localStorage.removeItem(DATA_CRYPTO_CONFIG.hintKey);
-              showMessage("Password hint removed", "success");
-            }
-            closeSecurityModal();
-          },
-        });
-      }
-
       function setLockStatus(message, type = "") {
         const el = $("ticketpadLockStatus");
         if (!el) return;
@@ -1414,7 +1124,7 @@
       function setLockUiMode(mode) {
         isCreatingVault = mode === "create";
         $("ticketpadLockSubtitle").textContent = isCreatingVault
-          ? "Create a password for this browser vault."
+          ? "Create a password for a fresh start, or restore a backup."
           : "Enter your password to unlock saved data.";
         $("ticketpadUnlockBtn").querySelector("span").textContent =
           isCreatingVault ? "Create Vault" : "Unlock";
@@ -1425,19 +1135,7 @@
           "hidden",
           !isCreatingVault,
         );
-        $("ticketpadPasswordHintInput").classList.toggle(
-          "hidden",
-          !isCreatingVault,
-        );
-        $("ticketpadImportRecoveryBtn").classList.toggle(
-          "hidden",
-          isCreatingVault,
-        );
-
-        const hint = localStorage.getItem(DATA_CRYPTO_CONFIG.hintKey);
-        const hintEl = $("ticketpadPasswordHint");
-        hintEl.textContent = hint ? `Hint: ${hint}` : "";
-        hintEl.classList.toggle("hidden", !hint || isCreatingVault);
+        $("ticketpadRestoreBackupBtn")?.classList.remove("hidden");
       }
 
       function showLockOverlay(mode = "unlock", status = "") {
@@ -1456,7 +1154,6 @@
         $("ticketpadLockOverlay").classList.remove("hidden");
         $("ticketpadPasswordInput").value = "";
         $("ticketpadPasswordConfirmInput").value = "";
-        $("ticketpadPasswordHintInput").value = "";
         setTimeout(() => $("ticketpadPasswordInput")?.focus(), 0);
       }
 
@@ -1515,7 +1212,7 @@
       }
 
       async function unlockWithPassphrase(passphrase) {
-        const salt = ensureDataSalt();
+        const salt = await ensureDataSalt();
         const key = await deriveDataCryptoKey(passphrase, base64ToBytes(salt));
         await readAllStoredData(key);
         dataCryptoKey = key;
@@ -1523,51 +1220,25 @@
         finishUnlock();
       }
 
-      async function createVaultFromUi(passphrase, hint) {
-        const salt = ensureDataSalt();
+      async function createVaultFromUi(passphrase) {
+        const salt = await ensureDataSalt();
         dataCryptoKey = await deriveDataCryptoKey(
           passphrase,
           base64ToBytes(salt),
         );
         activePassphrase = passphrase;
-        const recoveryKey = createRecoveryKey();
-        await saveRecoveryWrapper(recoveryKey, passphrase);
-
-        if (hint.trim()) {
-          localStorage.setItem(DATA_CRYPTO_CONFIG.hintKey, hint.trim());
-        } else {
-          localStorage.removeItem(DATA_CRYPTO_CONFIG.hintKey);
-        }
 
         finishUnlock();
-        downloadTextFile(
-          "TicketPad-Recovery-Key.txt",
-          recoveryFileText(recoveryKey),
-        );
-        showRecoveryKeyPanel(recoveryKey);
       }
-
-      async function unlockWithRecoveryKey(
-        recoveryKey,
-        wrapper = getRecoveryWrapper(),
-        salt = getDataSalt(),
-      ) {
-        if (!wrapper || !salt)
-          throw new Error("No recovery key is configured for this vault.");
-
-        const recoveredPassphrase = await decryptTextWithPassphrase(
-          wrapper,
-          normalizeRecoveryKey(recoveryKey),
-          salt,
-        );
-
-        await unlockWithPassphrase(recoveredPassphrase);
+      function reloadTicketPadData() {
+        loadTickets();
+        loadPinnedTickets();
+        loadTemplates();
+        updateTemplateSuggestions();
       }
-
       async function submitLockPassword() {
         const password = $("ticketpadPasswordInput")?.value || "";
         const confirmPassword = $("ticketpadPasswordConfirmInput")?.value || "";
-        const hint = $("ticketpadPasswordHintInput")?.value || "";
 
         try {
           if (!password) {
@@ -1586,11 +1257,12 @@
               return;
             }
 
-            await createVaultFromUi(password, hint);
+            await createVaultFromUi(password);
             return;
           }
 
           await unlockWithPassphrase(password);
+          reloadTicketPadData();
         } catch (error) {
           console.error(error);
           setLockStatus(
@@ -1716,9 +1388,7 @@
           submitText: "Change Password",
           submitIcon: "fa-solid fa-key",
           onSubmit: async (formData) => {
-            const currentSalt = localStorage.getItem(
-              DATA_CRYPTO_CONFIG.saltKey,
-            );
+            const currentSalt = getDataSalt();
             if (!currentSalt) throw new Error("Encryption salt is missing");
 
             const currentPassword = String(
@@ -1758,22 +1428,11 @@
               plainData.templates,
               newKey,
             );
-            localStorage.setItem(DATA_CRYPTO_CONFIG.saltKey, newSalt);
             await persistDataSaltToDatabase(newSalt);
             dataCryptoKey = newKey;
             activePassphrase = newPassword;
-            const wrapper = getRecoveryWrapper();
 
-            if (wrapper) {
-              showMessage(
-                "Password changed. Generate a new recovery key.",
-                "success",
-              );
-            }
-            loadTickets();
-            loadPinnedTickets();
-            loadTemplates();
-            updateTemplateSuggestions();
+            reloadTicketPadData();
             showMessage("Encryption password changed", "success");
             closeSecurityModal();
           },
@@ -1841,15 +1500,13 @@
         req.onsuccess = async (e) => {
           db = e.target.result;
           try {
-            await restoreDataSaltFromDatabase();
+            await loadSettingsCache();
+            applySavedTheme();
             const unlocked = await initDataEncryption();
             if (!unlocked) return;
             await persistDataSaltToDatabase(getDataSalt());
             await migrateExistingDataToEncryption();
-            loadTickets();
-            loadPinnedTickets();
-            loadTemplates();
-            updateTemplateSuggestions();
+            reloadTicketPadData();
           } catch (error) {
             console.error(error);
             alert(
@@ -1922,10 +1579,6 @@
           if (!saved.length) return;
 
           const now = Date.now();
-
-          // TESTING = 1 minute
-          // const expiryTime = 5 * 60 * 1000;
-
           // PRODUCTION:
           const expiryTime = 7 * 24 * 60 * 60 * 1000;
 
@@ -1988,13 +1641,15 @@
               algorithm: "AES-GCM",
               kdf: "PBKDF2-SHA-256",
               iterations: DATA_CRYPTO_CONFIG.iterations,
-              salt: localStorage.getItem(DATA_CRYPTO_CONFIG.saltKey),
+              salt: getDataSalt(),
             },
             exportedAt: new Date().toISOString(),
             stores: {
               tickets: await getRawObjectStoreRecords("tickets"),
               templates: await getRawObjectStoreRecords("templates"),
-              settings: await getRawObjectStoreRecords(SETTINGS_STORE),
+              settings: (await getRawObjectStoreRecords(SETTINGS_STORE)).filter(
+                (record) => isRetainedSettingKey(record?.key),
+              ),
             },
           };
 
@@ -2030,13 +1685,85 @@
 
           await writable.close();
 
-          showMessage("IndexedDB backup exported", "success");
+          showMessage("Database backup exported", "success");
         } catch (error) {
           console.error(error);
           showMessage("Export failed", "error");
         }
       }
 
+      function ensureBackupSaltSetting(backup) {
+        if (!backup.encryption?.salt) return backup.settings;
+        const hasSalt = backup.settings.some(
+          (record) => record?.key === DATA_CRYPTO_CONFIG.saltKey,
+        );
+        if (hasSalt) return backup.settings;
+        return [
+          ...backup.settings,
+          {
+            key: DATA_CRYPTO_CONFIG.saltKey,
+            value: backup.encryption.salt,
+            updatedAt: backup.exportedAt || new Date().toISOString(),
+          },
+        ];
+      }
+
+      function replaceStoreRecords(storeName, records) {
+        return new Promise((resolve, reject) => {
+          if (!db || !db.objectStoreNames.contains(storeName)) {
+            resolve(0);
+            return;
+          }
+
+          const keyField = storeName === SETTINGS_STORE ? "key" : "id";
+          const validRecords = records.filter((record) => record?.[keyField]);
+          const tx = db.transaction([storeName], "readwrite");
+          const store = tx.objectStore(storeName);
+
+          store.clear();
+          validRecords.forEach((record) => store.put(record));
+
+          tx.oncomplete = () => resolve(validRecords.length);
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+        });
+      }
+
+      async function restoreIndexedDBBackup(payload) {
+        if (!db) throw new Error("Database is not ready");
+
+        const backup = normalizeIndexedDBBackup(payload);
+        backup.encryption = payload?.encryption || null;
+        backup.exportedAt = payload?.exportedAt || "";
+        backup.settings = ensureBackupSaltSetting(backup).filter((record) =>
+          isRetainedSettingKey(record?.key),
+        );
+
+        const total =
+          backup.tickets.length +
+          backup.templates.length +
+          backup.settings.length;
+        if (!total) throw new Error("No TicketPad data was found in backup");
+
+        const shouldRestore = confirm(
+          `Restore this backup?\n\nThis will replace the current TicketPad database and you will unlock it with the backup password.`,
+        );
+        if (!shouldRestore) return false;
+
+        await replaceStoreRecords("tickets", backup.tickets);
+        await replaceStoreRecords("templates", backup.templates);
+        await replaceStoreRecords(SETTINGS_STORE, backup.settings);
+        await loadSettingsCache();
+        applySavedTheme();
+
+        dataCryptoKey = null;
+        activePassphrase = "";
+        showLockOverlay(
+          "unlock",
+          "Backup restored. Enter the backup password.",
+        );
+        return true;
+      }
       async function importIndexedDBBackup(event) {
         const input = event.target;
         const file = input.files?.[0];
@@ -2044,47 +1771,15 @@
         if (!file) return;
 
         try {
-          if (!db) throw new Error("Database is not ready");
-
           const payload = JSON.parse(await file.text());
-          const backup = await decryptImportedBackupIfNeeded(
-            normalizeIndexedDBBackup(payload),
-            payload?.encryption,
-          );
-          const total = backup.tickets.length + backup.templates.length;
-
-          if (!total) {
-            showMessage("No tickets or templates found in backup", "error");
-            return;
+          const restored = await restoreIndexedDBBackup(payload);
+          if (restored) {
+            showMessage("Database backup restored", "success");
           }
-
-          const shouldImport = confirm(
-            `Import ${backup.tickets.length} ticket(s) and ${backup.templates.length} template(s)?\n\nItems with the same ID will be updated.`,
-          );
-
-          if (!shouldImport) return;
-
-          const ticketCount = await importStoreRecords(
-            "tickets",
-            backup.tickets,
-          );
-          const templateCount = await importStoreRecords(
-            "templates",
-            backup.templates,
-          );
-          await persistDataSaltToDatabase(getDataSalt());
-
-          loadTickets();
-          loadTemplates();
-          updateTemplateSuggestions();
-
-          showMessage(
-            `Imported ${ticketCount} ticket(s), ${templateCount} template(s)`,
-            "success",
-          );
         } catch (error) {
           console.error(error);
-          showMessage("Import failed. Choose a valid backup JSON.", "error");
+          setLockStatus(error.message || "Restore failed.", "error");
+          showMessage("Restore failed. Choose a valid backup JSON.", "error");
         } finally {
           input.value = "";
         }
@@ -2347,6 +2042,9 @@
         );
       }
 
+      function setTemplateSuggestionsVisible(isVisible) {
+        $("templateSuggestions")?.classList.toggle("hidden", !isVisible);
+      }
       function updateTemplateSuggestions() {
         const container = $("templateSuggestions");
 
@@ -2357,7 +2055,7 @@
         // absolutely nothing typed → hide
         if (!searchContext) {
           container.innerHTML = "";
-          container.classList.add("hidden");
+          setTemplateSuggestionsVisible(false);
           return;
         }
 
@@ -2375,7 +2073,7 @@
 
           if (!matches.length) {
             container.innerHTML = "";
-            container.classList.add("hidden");
+            setTemplateSuggestionsVisible(false);
             return;
           }
 
@@ -2408,7 +2106,7 @@
             })
             .join("");
 
-          container.classList.remove("hidden");
+          setTemplateSuggestionsVisible(true);
         };
       }
 
@@ -5346,7 +5044,7 @@
         $("printerSelectionList").innerHTML = "";
         $("equipmentSelectionList").innerHTML = "";
         $("templateSuggestions").innerHTML = "";
-        $("templateSuggestions").classList.add("hidden");
+        setTemplateSuggestionsVisible(false);
         updateCurrentIssueTitle();
         updateFilledFieldHighlights();
 
@@ -5384,6 +5082,30 @@
 
       $("priorIssue").addEventListener("change", togglePriorTicketField);
       $("searchBox").addEventListener("input", loadTickets);
+      $("templateSuggestions")?.addEventListener(
+        "wheel",
+        (event) => {
+          const container = event.currentTarget;
+          const canScroll = container.scrollHeight > container.clientHeight + 1;
+          if (!canScroll) return;
+
+          const atTop = container.scrollTop <= 0;
+          const atBottom =
+            container.scrollTop + container.clientHeight >=
+            container.scrollHeight - 1;
+          const scrollingUp = event.deltaY < 0;
+          const scrollingDown = event.deltaY > 0;
+          const shouldScrollInside =
+            (scrollingUp && !atTop) || (scrollingDown && !atBottom);
+
+          if (shouldScrollInside) {
+            event.preventDefault();
+            event.stopPropagation();
+            container.scrollTop += event.deltaY;
+          }
+        },
+        { passive: false },
+      );
       $("templateSearchBox").addEventListener("input", loadTemplates);
       $("issueTitle").addEventListener("input", renderDynamicFields);
       $("issueTitle").addEventListener("input", updateTemplateSuggestions);
@@ -5452,13 +5174,20 @@
         // { id: "solar", name: "Solar" },
         // { id: "orchid", name: "Orchid" },
       ];
-      function setTheme(theme) {
+      async function setTheme(theme) {
         document.documentElement.setAttribute("data-theme", theme);
-        localStorage.setItem("app-theme", theme);
+        await setSetting("app-theme", theme);
+        highlightActiveTheme();
+      }
+      function getActiveTheme() {
+        return getSetting("app-theme", "dark-pro") || "dark-pro";
+      }
+      function applySavedTheme() {
+        document.documentElement.setAttribute("data-theme", getActiveTheme());
         highlightActiveTheme();
       }
       function highlightActiveTheme() {
-        const active = localStorage.getItem("app-theme") || "dark-pro";
+        const active = getActiveTheme();
         document
           .querySelectorAll(".theme-chip")
           .forEach((btn) =>
@@ -5477,8 +5206,7 @@
         highlightActiveTheme();
       }
       window.addEventListener("DOMContentLoaded", () => {
-        const saved = localStorage.getItem("app-theme") || "dark-pro";
-        document.documentElement.setAttribute("data-theme", saved);
+        applySavedTheme();
         initThemeSwitcher();
       });
       $("themeToggleBtn").addEventListener("click", () => {
@@ -5497,30 +5225,12 @@
           if (event.key === "Enter") submitLockPassword();
         },
       );
-      $("ticketpadImportRecoveryBtn")?.addEventListener(
-        "click",
-        requestRecoveryKeyImport,
-      );
-      $("ticketpadRecoveryImportFile")?.addEventListener(
+      $("ticketpadRestoreBackupBtn")?.addEventListener("click", () => {
+        $("ticketpadRestoreBackupFile")?.click();
+      });
+      $("ticketpadRestoreBackupFile")?.addEventListener(
         "change",
-        async (event) => {
-          const file = event.target.files?.[0];
-          if (!file) return;
-          const text = await file.text();
-          const recoveryTextarea = $("securityModalForm")?.querySelector(
-            'textarea[name="recoveryKey"]',
-          );
-          if (recoveryTextarea) {
-            recoveryTextarea.value = text;
-            setSecurityModalStatus(
-              "Recovery file loaded. Select Unlock to continue.",
-              "success",
-            );
-          } else {
-            await importRecoveryKeyFromText(text);
-          }
-          event.target.value = "";
-        },
+        importIndexedDBBackup,
       );
       $("securityModalCloseBtn")?.addEventListener("click", closeSecurityModal);
       $("securityModal")?.addEventListener("click", (event) => {
@@ -5537,18 +5247,6 @@
       $("securityChangePasswordBtn")?.addEventListener(
         "click",
         changeEncryptionPassword,
-      );
-      $("securityPasswordHintBtn")?.addEventListener(
-        "click",
-        updatePasswordHint,
-      );
-      $("securityExportRecoveryBtn")?.addEventListener(
-        "click",
-        exportRecoveryKey,
-      );
-      $("securityImportRecoveryBtn")?.addEventListener(
-        "click",
-        requestRecoveryKeyImport,
       );
       $("securityLockNowBtn")?.addEventListener("click", () =>
         lockTicketPad("Locked."),
