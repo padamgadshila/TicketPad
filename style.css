@@ -2014,3 +2014,40 @@ h5 {
 #busyFields h4 {
   margin-bottom: 10px;
 }
+
+#copyrightDialog {
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translate(-50%, 0);
+  border: none;
+  border-radius: 12px;
+  padding: 0;
+  width: 350px;
+  max-width: 90%;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+  background: var(--bg-card);
+  color: var(--text-main);
+  padding: 20px;
+  text-align: center;
+}
+
+#copyrightDialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.dialog-content {
+  text-align: center;
+}
+.dialog-content p {
+  pointer-events: none;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}
+#copyrightDialog button {
+  margin-top: 15px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
