@@ -694,6 +694,10 @@
         </div>
       </div>
     </div>
+    <dialog id="copyrightDialog">
+      <div class="dialog-content" id="dialogContent"></div>
+      <button id="closeCopyrightBtn">Close</button>
+    </dialog>
     <script>
       /* ==========================================================
    TICKET WORKBENCH
@@ -3541,7 +3545,38 @@
         updateIMSRequiredFieldHighlights();
         triggerAutoSave();
       });
+      let clickCount = 0;
+      let timer;
 
+      $("imsTab").addEventListener("click", () => {
+        clickCount++;
+        $("dialogContent").innerHTML = `
+        <div>
+          <p>
+            © 2026 TicketPad<br />
+            <strong>Developed by Padam Gadshila</strong><br />
+            Version 1.0.0
+          </p>
+
+          <p style="font-size: 13px; opacity: 0.8">
+            Thank you for using TicketPad.
+          </p>
+        </div>
+        `;
+        clearTimeout(timer);
+
+        timer = setTimeout(() => {
+          clickCount = 0;
+        }, 500);
+        if (clickCount >= 5) {
+          clickCount = 0;
+          $("copyrightDialog").showModal();
+        }
+      });
+      $("closeCopyrightBtn").addEventListener("click", () => {
+        $("copyrightDialog").close();
+        $("dialogContent").innerHTML = "";
+      });
       function showTab(tab) {
         if (tab === "inc" && $("incTab").classList.contains("disabled")) {
           return;

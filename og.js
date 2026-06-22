@@ -1,0 +1,5622 @@
+/* ==========================================================
+   TICKET WORKBENCH
+   ========================================================== */
+
+/* ==========================================================
+   GLOBALS & CONSTANTS
+   ========================================================== */
+let db = null,
+  currentTicket = null,
+  loadedTicketId = null;
+let editingTemplateId = null;
+let autoSaveTimer;
+const $ = (id) => document.getElementById(id);
+const imsRequiredFieldIds = [
+  "ticketId",
+  "userId",
+  "fullName",
+  "contact",
+  "userType",
+  "deviceType",
+  "object",
+  "deviation",
+  "workstationId",
+  "priorTicketNumber",
+  "validationRef",
+  "multiuser",
+  "workingHours",
+  "os",
+  "lastAttempt",
+  "priorIssue",
+];
+/* ==========================================================
+   CORE HELPERS
+   ========================================================== */
+const val = (x, f = "NA") => (x && String(x).trim() ? String(x).trim() : f);
+
+function escapeHtml(value) {
+  return String(value || "").replace(
+    /[&<>"']/g,
+    (char) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;",
+      })[char],
+  );
+}
+
+function sectionHeader(title, icon = "") {
+  return [`━━━ ${icon} ${title} ━━━`];
+}
+/* ==========================================================
+   UI HELPERS
+   ========================================================== */
+function scrollToTop() {
+  window.scrollTo({
+    top: 0,
+    behavior: "smooth",
+  });
+}
+
+function flipCard() {
+  const card = $("flipCard");
+  card.classList.toggle("flipped");
+  scrollToTop();
+}
+
+function showMessage(t, type) {
+  const m = $("message");
+  m.textContent = t;
+  m.className = type;
+  m.style.display = "block";
+  setTimeout(() => (m.style.display = "none"), 3000);
+}
+
+// Button animation for copy/save actions
+function animateButtonSuccess(btn, successText = "✓ Copied") {
+  if (!btn) return;
+
+  const originalText = btn.innerHTML;
+  const originalBg = btn.style.background;
+
+  btn.innerHTML = successText;
+  btn.style.background = "#16a34a";
+  btn.disabled = true;
+
+  setTimeout(() => {
+    btn.innerHTML = originalText;
+    btn.style.background = originalBg;
+    btn.disabled = false;
+  }, 2000);
+}
+
+function updateFilledFieldHighlights(scope = document) {
+  scope.querySelectorAll("input, textarea, select").forEach((el) => {
+    if (el.type === "file" || el.type === "hidden") return;
+
+    const hasValue = Boolean(String(el.value || "").trim());
+    const customSelect = el.closest(".custom-select-field");
+
+    if (customSelect) {
+      customSelect.classList.toggle("filled-field", hasValue);
+    } else {
+      el.classList.toggle("filled-field", hasValue);
+    }
+  });
+}
+
+function updateIMSRequiredFieldHighlights() {
+  imsRequiredFieldIds.forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+
+    const missing = !String(el.value || "").trim();
+    el.classList.toggle("ims-required-missing", missing);
+    el.closest(".custom-select-field")?.classList.toggle(
+      "ims-required-missing",
+      missing,
+    );
+    el.setAttribute("aria-invalid", String(missing));
+  });
+}
+
+function clearIMSRequiredFieldHighlights() {
+  imsRequiredFieldIds.forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+
+    el.classList.remove("ims-required-missing");
+    el.closest(".custom-select-field")?.classList.remove(
+      "ims-required-missing",
+    );
+    el.removeAttribute("aria-invalid");
+  });
+}
+
+/* ==========================================================
+   AUTO SAVE
+   ========================================================== */
+function triggerAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(autoSaveTicket, 800);
+}
+
+function autoSaveTicket() {
+  if (!db) return;
+  const ticketId = $("ticketId").value.trim().toUpperCase();
+  if (!/^(IMS|INC)\d+$/i.test(ticketId)) return;
+  updateIMSRequiredFieldHighlights();
+  persistTicket(buildTicketData());
+}
+
+/* ==========================================================
+   EVENT LISTENERS
+   ========================================================== */
+
+/* ==========================================================
+   DATABASE
+   ========================================================== */
+const DATA_CRYPTO_CONFIG = {
+  marker: "__ticketpadEncrypted",
+  version: 1,
+  saltKey: "ticketpad-encryption-salt",
+  iterations: 250000,
+  autoLockMs: 30 * 60 * 1000,
+};
+const SETTINGS_STORE = "settings";
+let dataCryptoKey = null;
+let activePassphrase = "";
+let pendingUnlockResolve = null;
+let isCreatingVault = false;
+let autoLockTimer = null;
+const settingsCache = {};
+
+function bytesToBase64(bytes) {
+  const array = new Uint8Array(bytes);
+  let binary = "";
+  const chunkSize = 0x8000;
+
+  for (let i = 0; i < array.length; i += chunkSize) {
+    binary += String.fromCharCode(...array.subarray(i, i + chunkSize));
+  }
+
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+}
+
+async function deriveDataCryptoKey(passphrase, salt) {
+  const encodedPassphrase = new TextEncoder().encode(passphrase);
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    encodedPassphrase,
+    "PBKDF2",
+    false,
+    ["deriveKey"],
+  );
+
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: DATA_CRYPTO_CONFIG.iterations,
+      hash: "SHA-256",
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+function isRetainedSettingKey(key) {
+  return ![
+    "ticketpad-password-hint",
+    "ticketpad-recovery-wrapper",
+    "ticketpad-recovery-created-at",
+  ].includes(key);
+}
+
+function getSetting(key, fallback = "") {
+  return Object.prototype.hasOwnProperty.call(settingsCache, key)
+    ? settingsCache[key]
+    : fallback;
+}
+
+function settingsRecordsToMap(records = []) {
+  return records.reduce((map, record) => {
+    if (record?.key && isRetainedSettingKey(record.key))
+      map[record.key] = record.value;
+    return map;
+  }, {});
+}
+
+async function loadSettingsCache() {
+  const records = await getRawObjectStoreRecords(SETTINGS_STORE);
+  Object.keys(settingsCache).forEach((key) => delete settingsCache[key]);
+  Object.assign(settingsCache, settingsRecordsToMap(records));
+  await migrateLegacyLocalStorageSettings();
+}
+
+function writeSettingRecord(key, value) {
+  return new Promise((resolve, reject) => {
+    if (!db || !db.objectStoreNames.contains(SETTINGS_STORE)) {
+      resolve();
+      return;
+    }
+
+    const tx = db.transaction([SETTINGS_STORE], "readwrite");
+    tx.objectStore(SETTINGS_STORE).put({
+      key,
+      value,
+      updatedAt: new Date().toISOString(),
+    });
+
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function setSetting(key, value) {
+  settingsCache[key] = value;
+  await writeSettingRecord(key, value);
+}
+
+async function deleteSetting(key) {
+  delete settingsCache[key];
+  await new Promise((resolve, reject) => {
+    if (!db || !db.objectStoreNames.contains(SETTINGS_STORE)) {
+      resolve();
+      return;
+    }
+
+    const tx = db.transaction([SETTINGS_STORE], "readwrite");
+    tx.objectStore(SETTINGS_STORE).delete(key);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function migrateLegacyLocalStorageSettings() {
+  const legacyKeys = [DATA_CRYPTO_CONFIG.saltKey, "app-theme"];
+
+  for (const key of legacyKeys) {
+    const legacyValue = localStorage.getItem(key);
+    if (legacyValue && !getSetting(key)) {
+      await setSetting(key, legacyValue);
+    }
+    localStorage.removeItem(key);
+  }
+
+  localStorage.removeItem("ticketpad-password-hint");
+  localStorage.removeItem("ticketpad-recovery-wrapper");
+  localStorage.removeItem("ticketpad-recovery-created-at");
+  await deleteSetting("ticketpad-password-hint");
+  await deleteSetting("ticketpad-recovery-wrapper");
+  await deleteSetting("ticketpad-recovery-created-at");
+}
+
+function getDataSalt() {
+  return getSetting(DATA_CRYPTO_CONFIG.saltKey, "");
+}
+
+function persistDataSaltToDatabase(salt) {
+  return salt
+    ? setSetting(DATA_CRYPTO_CONFIG.saltKey, salt)
+    : Promise.resolve();
+}
+
+async function ensureDataSalt() {
+  let salt = getDataSalt();
+  if (!salt) {
+    const newSalt = crypto.getRandomValues(new Uint8Array(16));
+    salt = bytesToBase64(newSalt);
+    await setSetting(DATA_CRYPTO_CONFIG.saltKey, salt);
+  }
+  return salt;
+}
+
+function downloadTextFile(filename, text) {
+  const blob = new Blob([text], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function setSecurityModalStatus(message, type = "") {
+  const el = $("securityModalStatus");
+  if (!el) return;
+  el.textContent = message || "";
+  el.className = `security-modal-status ${type}`.trim();
+}
+
+function closeSecurityModal() {
+  $("securityModal")?.classList.add("hidden");
+  $("securityModalForm")?.replaceChildren();
+  setSecurityModalStatus("");
+}
+
+function openSecurityModal({
+  title,
+  subtitle,
+  icon = "fa-solid fa-shield-halved",
+  body = "",
+  submitText = "Save",
+  submitIcon = "fa-solid fa-floppy-disk",
+  cancelText = "Cancel",
+  onSubmit = null,
+  afterRender = null,
+}) {
+  const modal = $("securityModal");
+  const form = $("securityModalForm");
+  if (!modal || !form) return;
+
+  $("securityModalTitle").textContent = title;
+  $("securityModalSubtitle").textContent = subtitle;
+  $("securityModalIcon").className = icon;
+  form.innerHTML = `
+          ${body}
+          <div class="security-modal-actions">
+            <button type="button" class="security-secondary-btn" data-security-close="true">${cancelText}</button>
+            ${
+              onSubmit
+                ? `<button type="submit"><i class="${submitIcon}"></i><span>${submitText}</span></button>`
+                : ""
+            }
+          </div>
+        `;
+
+  form.onsubmit = async (event) => {
+    event.preventDefault();
+    if (!onSubmit) return;
+
+    const submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn?.setAttribute("disabled", "disabled");
+    setSecurityModalStatus("");
+
+    try {
+      await onSubmit(new FormData(form), form);
+    } catch (error) {
+      console.error(error);
+      setSecurityModalStatus(
+        error.message || "Security action failed",
+        "error",
+      );
+    } finally {
+      submitBtn?.removeAttribute("disabled");
+    }
+  };
+
+  modal.classList.remove("hidden");
+  setSecurityModalStatus("");
+  afterRender?.(form);
+  setTimeout(() => form.querySelector("input, textarea, button")?.focus(), 0);
+}
+
+function setLockStatus(message, type = "") {
+  const el = $("ticketpadLockStatus");
+  if (!el) return;
+  el.textContent = message || "";
+  el.className = `ticketpad-lock-status ${type}`.trim();
+}
+
+function setLockUiMode(mode) {
+  isCreatingVault = mode === "create";
+  $("ticketpadLockSubtitle").textContent = isCreatingVault
+    ? "Create a password for a fresh start, or restore a backup."
+    : "Enter your password to unlock saved data.";
+  $("ticketpadUnlockBtn").querySelector("span").textContent = isCreatingVault
+    ? "Create Vault"
+    : "Unlock";
+  $("ticketpadPasswordInput").autocomplete = isCreatingVault
+    ? "new-password"
+    : "current-password";
+  $("ticketpadPasswordConfirmInput").classList.toggle(
+    "hidden",
+    !isCreatingVault,
+  );
+  $("ticketpadRestoreBackupBtn")?.classList.remove("hidden");
+}
+
+function showLockOverlay(mode = "unlock", status = "") {
+  setLockUiMode(mode);
+  const title = $("ticketpadLockOverlay")?.querySelector("h1");
+  if (title) {
+    title.textContent =
+      status && status.toLowerCase().includes("auto locked")
+        ? "Session Locked"
+        : isCreatingVault
+          ? "Create TicketPad Password"
+          : "TicketPad Locked";
+  }
+  setLockStatus(status);
+  document.body.classList.add("ticketpad-locked");
+  $("ticketpadLockOverlay").classList.remove("hidden");
+  $("ticketpadPasswordInput").value = "";
+  $("ticketpadPasswordConfirmInput").value = "";
+  setTimeout(() => $("ticketpadPasswordInput")?.focus(), 0);
+}
+
+function hideLockOverlay() {
+  document.body.classList.remove("ticketpad-locked");
+  $("ticketpadLockOverlay").classList.add("hidden");
+  setLockStatus("");
+}
+
+function hasAnySavedRecords() {
+  return Promise.all([
+    getRawObjectStoreRecords("tickets"),
+    getRawObjectStoreRecords("templates"),
+  ]).then((stores) => stores.some((records) => records.length));
+}
+
+function waitForUnlock(mode) {
+  showLockOverlay(mode);
+  return new Promise((resolve) => {
+    pendingUnlockResolve = resolve;
+  });
+}
+
+function finishUnlock() {
+  hideLockOverlay();
+  resetAutoLockTimer();
+  pendingUnlockResolve?.(true);
+  pendingUnlockResolve = null;
+}
+
+function lockTicketPad(reason = "Locked") {
+  dataCryptoKey = null;
+  activePassphrase = "";
+  clearTimeout(autoLockTimer);
+  $("securityMenu")?.classList.add("collapsed");
+  showLockOverlay("unlock", reason);
+}
+
+function resetAutoLockTimer() {
+  clearTimeout(autoLockTimer);
+  if (!dataCryptoKey) return;
+  autoLockTimer = setTimeout(
+    () => lockTicketPad("Auto locked after 15 minutes inactive."),
+    DATA_CRYPTO_CONFIG.autoLockMs,
+  );
+}
+
+function initAutoLock() {
+  ["pointerdown", "keydown", "input", "scroll", "touchstart"].forEach(
+    (eventName) => {
+      document.addEventListener(eventName, resetAutoLockTimer, {
+        passive: true,
+      });
+    },
+  );
+}
+
+async function unlockWithPassphrase(passphrase) {
+  const salt = await ensureDataSalt();
+  const key = await deriveDataCryptoKey(passphrase, base64ToBytes(salt));
+  await readAllStoredData(key);
+  dataCryptoKey = key;
+  activePassphrase = passphrase;
+  finishUnlock();
+}
+
+async function createVaultFromUi(passphrase) {
+  const salt = await ensureDataSalt();
+  dataCryptoKey = await deriveDataCryptoKey(passphrase, base64ToBytes(salt));
+  activePassphrase = passphrase;
+
+  finishUnlock();
+}
+function reloadTicketPadData() {
+  loadTickets();
+  loadPinnedTickets();
+  loadTemplates();
+  updateTemplateSuggestions();
+}
+async function submitLockPassword() {
+  const password = $("ticketpadPasswordInput")?.value || "";
+  const confirmPassword = $("ticketpadPasswordConfirmInput")?.value || "";
+
+  try {
+    if (!password) {
+      setLockStatus("Enter your TicketPad password.", "error");
+      return;
+    }
+
+    if (isCreatingVault) {
+      if (password.length < 8) {
+        setLockStatus("Use at least 8 characters.", "error");
+        return;
+      }
+
+      if (password !== confirmPassword) {
+        setLockStatus("Passwords do not match.", "error");
+        return;
+      }
+
+      await createVaultFromUi(password);
+      return;
+    }
+
+    await unlockWithPassphrase(password);
+    reloadTicketPadData();
+  } catch (error) {
+    console.error(error);
+    setLockStatus(error.message || "Unable to unlock TicketPad.", "error");
+  }
+}
+
+async function initDataEncryption() {
+  if (dataCryptoKey) return true;
+
+  if (!window.crypto?.subtle) {
+    alert("This browser does not support Web Crypto encryption.");
+    return false;
+  }
+
+  const hasSavedData = await hasAnySavedRecords();
+  const hasSalt = Boolean(getDataSalt());
+  return waitForUnlock(hasSavedData || hasSalt ? "unlock" : "create");
+}
+
+function isEncryptedRecord(record) {
+  return Boolean(record?.[DATA_CRYPTO_CONFIG.marker]);
+}
+
+async function encryptRecord(record, key = dataCryptoKey) {
+  if (!key) throw new Error("Encryption key is locked");
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(record));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    plaintext,
+  );
+
+  return {
+    id: record.id,
+    [DATA_CRYPTO_CONFIG.marker]: true,
+    v: DATA_CRYPTO_CONFIG.version,
+    iv: bytesToBase64(iv),
+    data: bytesToBase64(encrypted),
+  };
+}
+
+async function decryptRecord(record, key = dataCryptoKey) {
+  if (!record || !isEncryptedRecord(record)) return record;
+  if (!key) throw new Error("Encryption key is locked");
+
+  try {
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: base64ToBytes(record.iv) },
+      key,
+      base64ToBytes(record.data),
+    );
+    return JSON.parse(new TextDecoder().decode(decrypted));
+  } catch (error) {
+    throw new Error("Wrong encryption password or corrupted saved data");
+  }
+}
+
+async function decryptRecords(records, key = dataCryptoKey) {
+  return Promise.all(
+    (records || []).map((record) => decryptRecord(record, key)),
+  );
+}
+
+async function readAllStoredData(key = dataCryptoKey) {
+  const [tickets, templates] = await Promise.all([
+    getRawObjectStoreRecords("tickets"),
+    getRawObjectStoreRecords("templates"),
+  ]);
+
+  return {
+    tickets: await decryptRecords(tickets, key),
+    templates: await decryptRecords(templates, key),
+  };
+}
+
+async function replaceStoreWithEncryptedRecords(storeName, records, key) {
+  const encryptedRecords = await Promise.all(
+    records.map((record) => encryptRecord(record, key)),
+  );
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction([storeName], "readwrite");
+    const store = tx.objectStore(storeName);
+
+    store.clear();
+    encryptedRecords.forEach((record) => store.put(record));
+
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function changeEncryptionPassword() {
+  if (!db) {
+    showMessage("Database is not ready yet", "error");
+    return;
+  }
+
+  openSecurityModal({
+    title: "Change Password",
+    subtitle: "Update the password used to unlock saved TicketPad data.",
+    icon: "fa-solid fa-key",
+    body: `
+            <label class="security-field">
+              <span>Current Password</span>
+              <input name="currentPassword" type="password" autocomplete="current-password" />
+            </label>
+            <label class="security-field">
+              <span>New Password</span>
+              <input name="newPassword" type="password" autocomplete="new-password" />
+            </label>
+            <label class="security-field">
+              <span>Confirm New Password</span>
+              <input name="confirmPassword" type="password" autocomplete="new-password" />
+            </label>
+          `,
+    submitText: "Change Password",
+    submitIcon: "fa-solid fa-key",
+    onSubmit: async (formData) => {
+      const currentSalt = getDataSalt();
+      if (!currentSalt) throw new Error("Encryption salt is missing");
+
+      const currentPassword = String(formData.get("currentPassword") || "");
+      const newPassword = String(formData.get("newPassword") || "");
+      const confirmPassword = String(formData.get("confirmPassword") || "");
+
+      if (!currentPassword) throw new Error("Enter your current password.");
+      if (newPassword.length < 8)
+        throw new Error("Use at least 8 characters for the new password.");
+      if (newPassword !== confirmPassword)
+        throw new Error("New passwords do not match.");
+
+      const currentKey = await deriveDataCryptoKey(
+        currentPassword,
+        base64ToBytes(currentSalt),
+      );
+      const plainData = await readAllStoredData(currentKey);
+
+      const newSaltBytes = crypto.getRandomValues(new Uint8Array(16));
+      const newSalt = bytesToBase64(newSaltBytes);
+      const newKey = await deriveDataCryptoKey(newPassword, newSaltBytes);
+
+      await replaceStoreWithEncryptedRecords(
+        "tickets",
+        plainData.tickets,
+        newKey,
+      );
+      await replaceStoreWithEncryptedRecords(
+        "templates",
+        plainData.templates,
+        newKey,
+      );
+      await persistDataSaltToDatabase(newSalt);
+      dataCryptoKey = newKey;
+      activePassphrase = newPassword;
+
+      reloadTicketPadData();
+      showMessage("Encryption password changed", "success");
+      closeSecurityModal();
+    },
+  });
+}
+
+async function migrateStoreToEncryption(storeName) {
+  const records = await getRawObjectStoreRecords(storeName);
+  const plainRecords = records.filter((record) => !isEncryptedRecord(record));
+  if (!plainRecords.length) return;
+  const encryptedRecords = await Promise.all(
+    plainRecords.map((record) => encryptRecord(record)),
+  );
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction([storeName], "readwrite");
+    const store = tx.objectStore(storeName);
+
+    encryptedRecords.forEach((record) => store.put(record));
+
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function migrateExistingDataToEncryption() {
+  await migrateStoreToEncryption("tickets");
+  await migrateStoreToEncryption("templates");
+  await getObjectStoreRecords("tickets");
+  await getObjectStoreRecords("templates");
+}
+
+function getRawObjectStoreRecords(storeName) {
+  return new Promise((resolve, reject) => {
+    if (!db || !db.objectStoreNames.contains(storeName)) {
+      resolve([]);
+      return;
+    }
+
+    const tx = db.transaction([storeName], "readonly");
+    const req = tx.objectStore(storeName).getAll();
+
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Databse thing
+function openDB() {
+  const req = indexedDB.open("TicketPad", 6);
+  req.onupgradeneeded = (e) => {
+    const d = e.target.result;
+    if (!d.objectStoreNames.contains("tickets"))
+      d.createObjectStore("tickets", { keyPath: "id" });
+    if (!d.objectStoreNames.contains("templates"))
+      d.createObjectStore("templates", { keyPath: "id" });
+    if (d.objectStoreNames.contains("scratchpad"))
+      d.deleteObjectStore("scratchpad");
+    if (!d.objectStoreNames.contains(SETTINGS_STORE))
+      d.createObjectStore(SETTINGS_STORE, { keyPath: "key" });
+  };
+  req.onsuccess = async (e) => {
+    db = e.target.result;
+    try {
+      await loadSettingsCache();
+      applySavedTheme();
+      const unlocked = await initDataEncryption();
+      if (!unlocked) return;
+      await persistDataSaltToDatabase(getDataSalt());
+      await migrateExistingDataToEncryption();
+      reloadTicketPadData();
+    } catch (error) {
+      console.error(error);
+      alert(error.message || "Unable to unlock encrypted TicketPad data.");
+      db = null;
+    }
+  };
+}
+
+async function putTicketRecord(data) {
+  if (!db) return;
+
+  const encryptedData = await encryptRecord(data);
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(["tickets"], "readwrite");
+    tx.objectStore("tickets").put(encryptedData);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function persistTicket(data, callback) {
+  if (!db) return;
+
+  currentTicket = data;
+  await putTicketRecord(data);
+
+  $("incTab").classList.remove("disabled");
+  updatePreview();
+  loadTickets();
+  loadPinnedTickets();
+
+  if (callback) callback();
+}
+
+function getObjectStoreRecords(storeName) {
+  return new Promise((resolve, reject) => {
+    if (!db || !db.objectStoreNames.contains(storeName)) {
+      resolve([]);
+      return;
+    }
+
+    const tx = db.transaction([storeName], "readonly");
+    const req = tx.objectStore(storeName).getAll();
+
+    req.onsuccess = async () => {
+      try {
+        resolve(await decryptRecords(req.result || []));
+      } catch (error) {
+        reject(error);
+      }
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function checkOldTickets() {
+  if (!db) return;
+
+  const tx = db.transaction(["tickets"], "readonly");
+  const store = tx.objectStore("tickets");
+  const req = store.getAll();
+
+  req.onsuccess = async () => {
+    const saved = await decryptRecords(req.result || []);
+
+    if (!saved.length) return;
+
+    const now = Date.now();
+    // PRODUCTION:
+    const expiryTime = 7 * 24 * 60 * 60 * 1000;
+
+    const oldTickets = saved.filter((ticket) => {
+      if (!ticket.updatedAt) return false;
+
+      const ticketTime = new Date(ticket.updatedAt).getTime();
+
+      return now - ticketTime > expiryTime;
+    });
+
+    if (!oldTickets.length) return;
+
+    const shouldDelete = confirm(
+      `${oldTickets.length} saved ticket(s) are older than ${
+        expiryTime === 60000 ? "1 minute" : "7 days"
+      }.\n\nDelete them now?`,
+    );
+
+    if (!shouldDelete) return;
+
+    const deleteTx = db.transaction(["tickets"], "readwrite");
+    const deleteStore = deleteTx.objectStore("tickets");
+
+    oldTickets.forEach((ticket) => {
+      deleteStore.delete(ticket.id);
+    });
+
+    deleteTx.oncomplete = () => {
+      loadTickets();
+
+      showMessage(`${oldTickets.length} old ticket(s) deleted.`, "success");
+    };
+  };
+}
+
+/* ==========================================================
+   IMPORT / EXPORT
+   ========================================================== */
+async function exportIndexedDBBackup() {
+  if (!db) {
+    showMessage("Database is not ready yet", "error");
+    return;
+  }
+  if (!window.showSaveFilePicker) {
+    showMessage("Your browser does not support File System API", "error");
+    return;
+  }
+
+  try {
+    const backup = {
+      app: "TicketPad",
+      database: "TicketPad",
+      version: db.version,
+      encrypted: true,
+      encryption: {
+        algorithm: "AES-GCM",
+        kdf: "PBKDF2-SHA-256",
+        iterations: DATA_CRYPTO_CONFIG.iterations,
+        salt: getDataSalt(),
+      },
+      exportedAt: new Date().toISOString(),
+      stores: {
+        tickets: await getRawObjectStoreRecords("tickets"),
+        templates: await getRawObjectStoreRecords("templates"),
+        settings: (await getRawObjectStoreRecords(SETTINGS_STORE)).filter(
+          (record) => isRetainedSettingKey(record?.key),
+        ),
+      },
+    };
+
+    // const blob = new Blob([JSON.stringify(backup, null, 2)], {
+    //   type: "application/json",
+    // });
+    // const url = URL.createObjectURL(blob);
+    // const link = document.createElement("a");
+    // const stamp = new Date().toISOString().slice(0, 10);
+
+    // link.href = url;
+    // link.download = `ticketpad-backup-${stamp}.json`;
+    // document.body.appendChild(link);
+    // link.click();
+    // link.remove();
+    // URL.revokeObjectURL(url);
+
+    const handle = await window.showSaveFilePicker({
+      suggestedName: `ticketpad-backup.json`,
+      types: [
+        {
+          description: "JSON Backup",
+          accept: {
+            "application/json": [".json"],
+          },
+        },
+      ],
+    });
+
+    const writable = await handle.createWritable();
+
+    await writable.write(JSON.stringify(backup, null, 2));
+
+    await writable.close();
+
+    showMessage("Database backup exported", "success");
+  } catch (error) {
+    console.error(error);
+    showMessage("Export failed", "error");
+  }
+}
+
+function ensureBackupSaltSetting(backup) {
+  if (!backup.encryption?.salt) return backup.settings;
+  const hasSalt = backup.settings.some(
+    (record) => record?.key === DATA_CRYPTO_CONFIG.saltKey,
+  );
+  if (hasSalt) return backup.settings;
+  return [
+    ...backup.settings,
+    {
+      key: DATA_CRYPTO_CONFIG.saltKey,
+      value: backup.encryption.salt,
+      updatedAt: backup.exportedAt || new Date().toISOString(),
+    },
+  ];
+}
+
+function replaceStoreRecords(storeName, records) {
+  return new Promise((resolve, reject) => {
+    if (!db || !db.objectStoreNames.contains(storeName)) {
+      resolve(0);
+      return;
+    }
+
+    const keyField = storeName === SETTINGS_STORE ? "key" : "id";
+    const validRecords = records.filter((record) => record?.[keyField]);
+    const tx = db.transaction([storeName], "readwrite");
+    const store = tx.objectStore(storeName);
+
+    store.clear();
+    validRecords.forEach((record) => store.put(record));
+
+    tx.oncomplete = () => resolve(validRecords.length);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+async function restoreIndexedDBBackup(payload) {
+  if (!db) throw new Error("Database is not ready");
+
+  const backup = normalizeIndexedDBBackup(payload);
+  backup.encryption = payload?.encryption || null;
+  backup.exportedAt = payload?.exportedAt || "";
+  backup.settings = ensureBackupSaltSetting(backup).filter((record) =>
+    isRetainedSettingKey(record?.key),
+  );
+
+  const total =
+    backup.tickets.length + backup.templates.length + backup.settings.length;
+  if (!total) throw new Error("No TicketPad data was found in backup");
+
+  const shouldRestore = confirm(
+    `Restore this backup?\n\nThis will replace the current TicketPad database and you will unlock it with the backup password.`,
+  );
+  if (!shouldRestore) return false;
+
+  await replaceStoreRecords("tickets", backup.tickets);
+  await replaceStoreRecords("templates", backup.templates);
+  await replaceStoreRecords(SETTINGS_STORE, backup.settings);
+  await loadSettingsCache();
+  applySavedTheme();
+
+  dataCryptoKey = null;
+  activePassphrase = "";
+  showLockOverlay("unlock", "Backup restored. Enter the backup password.");
+  return true;
+}
+async function importIndexedDBBackup(event) {
+  const input = event.target;
+  const file = input.files?.[0];
+
+  if (!file) return;
+
+  try {
+    const payload = JSON.parse(await file.text());
+    const restored = await restoreIndexedDBBackup(payload);
+    if (restored) {
+      showMessage("Database backup restored", "success");
+    }
+  } catch (error) {
+    console.error(error);
+    setLockStatus(error.message || "Restore failed.", "error");
+    showMessage("Restore failed. Choose a valid backup JSON.", "error");
+  } finally {
+    input.value = "";
+  }
+}
+
+function normalizeIndexedDBBackup(payload) {
+  if (Array.isArray(payload)) {
+    return {
+      tickets: payload,
+      templates: [],
+      settings: [],
+    };
+  }
+
+  return {
+    tickets: Array.isArray(payload?.stores?.tickets)
+      ? payload.stores.tickets
+      : Array.isArray(payload?.tickets)
+        ? payload.tickets
+        : [],
+    templates: Array.isArray(payload?.stores?.templates)
+      ? payload.stores.templates
+      : Array.isArray(payload?.templates)
+        ? payload.templates
+        : [],
+    settings: Array.isArray(payload?.stores?.settings)
+      ? payload.stores.settings
+      : Array.isArray(payload?.settings)
+        ? payload.settings
+        : [],
+  };
+}
+
+async function decryptImportedBackupIfNeeded(backup, encryption = null) {
+  const allRecords = [...backup.tickets, ...backup.templates];
+  const hasEncryptedRecords = allRecords.some(isEncryptedRecord);
+
+  if (!hasEncryptedRecords) return backup;
+
+  if (!encryption?.salt) {
+    return {
+      tickets: await decryptRecords(backup.tickets),
+      templates: await decryptRecords(backup.templates),
+    };
+  }
+
+  const passphrase = prompt("Enter the password for this encrypted backup.");
+  if (!passphrase) throw new Error("Backup password was not entered");
+
+  const backupKey = await deriveDataCryptoKey(
+    passphrase,
+    base64ToBytes(encryption.salt),
+  );
+
+  return {
+    tickets: await decryptRecords(backup.tickets, backupKey),
+    templates: await decryptRecords(backup.templates, backupKey),
+  };
+}
+
+async function importStoreRecords(storeName, records) {
+  const validRecords = records.filter((record) => record?.id);
+  const encryptedRecords = await Promise.all(
+    validRecords.map(async (record) =>
+      encryptRecord(await decryptRecord(record)),
+    ),
+  );
+
+  return new Promise((resolve, reject) => {
+    if (!encryptedRecords.length) {
+      resolve(0);
+      return;
+    }
+
+    const tx = db.transaction([storeName], "readwrite");
+    const store = tx.objectStore(storeName);
+
+    encryptedRecords.forEach((record) => {
+      store.put(record);
+    });
+
+    tx.oncomplete = () => resolve(encryptedRecords.length);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/* ==========================================================
+   DRAWERS & MODALS
+   ========================================================== */
+// Left button
+function setDrawerButtonState(buttonId, isOpen, openIcon, closedIcon) {
+  const button = $(buttonId);
+  const icon = button?.querySelector("i");
+
+  if (!button || !icon) return;
+
+  button.classList.toggle("active", isOpen);
+  icon.classList.toggle(openIcon, isOpen);
+  icon.classList.toggle(closedIcon, !isOpen);
+}
+
+function closeSideDrawer() {
+  $("sideDrawer").classList.remove("open");
+  setDrawerButtonState(
+    "sideToggleBtn",
+    false,
+    "fa-arrow-left",
+    "fa-arrow-right",
+  );
+}
+
+function closeTemplateDrawer() {
+  $("templateDrawer").classList.remove("open");
+  setDrawerButtonState("templateToggleBtn", false, "fa-arrow-left", "fa-book");
+}
+
+function closeDrawers() {
+  closeSideDrawer();
+  closeTemplateDrawer();
+  $("sideOverlay").classList.remove("show");
+}
+
+function toggleSideDrawer() {
+  const willOpen = !$("sideDrawer").classList.contains("open");
+
+  closeTemplateDrawer();
+  $("sideDrawer").classList.toggle("open", willOpen);
+  $("sideOverlay").classList.toggle("show", willOpen);
+  setDrawerButtonState(
+    "sideToggleBtn",
+    willOpen,
+    "fa-arrow-left",
+    "fa-arrow-right",
+  );
+
+  if (willOpen) {
+    loadTickets();
+    // checkOldTickets();
+    $("searchBox").focus();
+  }
+}
+
+function toggleTemplateDrawer() {
+  const willOpen = !$("templateDrawer").classList.contains("open");
+
+  closeSideDrawer();
+  $("templateDrawer").classList.toggle("open", willOpen);
+  $("sideOverlay").classList.toggle("show", willOpen);
+  setDrawerButtonState(
+    "templateToggleBtn",
+    willOpen,
+    "fa-arrow-left",
+    "fa-book",
+  );
+
+  if (willOpen) {
+    loadTemplates();
+    $("templateSearchBox").focus();
+  }
+}
+
+/* ==========================================================
+   TEMPLATE SYSTEM
+   ========================================================== */
+function getTemplateKeywords(issueTitle) {
+  return String(issueTitle || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word.length >= 2);
+}
+
+function getTemplateEnvironment() {
+  return {
+    deviceType: $("deviceType").value || "",
+    os: $("os").value || "",
+    userType: $("userType").value || "",
+    object: $("object").value || "",
+    deviation: $("deviation").value || "",
+  };
+}
+
+function getTemplateDisplayTitle(template) {
+  return template?.name || template?.issueTitle || "Untitled Template";
+}
+
+function buildTemplateData(name) {
+  const issueTitle = $("issueTitle").value.trim();
+  const now = new Date().toISOString();
+  const env = getTemplateEnvironment();
+
+  return {
+    id: `template-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    issueTitle,
+    issueKeywords: getTemplateKeywords(issueTitle),
+
+    deviceTypes: env.deviceType ? [env.deviceType] : [],
+    os: env.os ? [env.os] : [],
+    object: env.object || "",
+    deviation: env.deviation || "",
+    userTypes: env.userType ? [env.userType] : [],
+
+    troubleshooting: $("troubleshooting").value,
+
+    usageCount: 0,
+    lastUsedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+async function saveCurrentTemplate(btn) {
+  if (!db) return;
+
+  const issueTitle = $("issueTitle").value.trim();
+  const troubleshooting = $("troubleshooting").value.trim();
+
+  if (!issueTitle || !troubleshooting) {
+    // showMessage("Add Short Description and TS notes first", "error");
+    return;
+  }
+
+  const env = getTemplateEnvironment();
+  const defaultName = [issueTitle].filter(Boolean).join(" - ");
+  const name = prompt("Template name", defaultName);
+
+  if (!name || !name.trim()) return;
+
+  const encryptedTemplate = await encryptRecord(buildTemplateData(name.trim()));
+  const tx = db.transaction(["templates"], "readwrite");
+  tx.objectStore("templates").put(encryptedTemplate);
+  tx.oncomplete = () => {
+    animateButtonSuccess(btn, "Saved");
+    loadTemplates();
+    updateTemplateSuggestions();
+  };
+}
+
+function templateMatchesIssue(template, issueQuery) {
+  const searchWords = getTemplateKeywords(issueQuery);
+  if (!searchWords.length) return false;
+
+  const issueTitle = String(
+    template.issueTitle || template.name || "",
+  ).toLowerCase();
+  const templateKeywords = template.issueKeywords || [];
+
+  return searchWords.every(
+    (word) => templateKeywords.includes(word) || issueTitle.includes(word),
+  );
+}
+
+function setTemplateSuggestionsVisible(isVisible) {
+  $("templateSuggestions")?.classList.toggle("hidden", !isVisible);
+}
+function updateTemplateSuggestions() {
+  const container = $("templateSuggestions");
+
+  if (!db || !container) return;
+
+  const searchContext = $("issueTitle")?.value.trim() || "";
+
+  // absolutely nothing typed → hide
+  if (!searchContext) {
+    container.innerHTML = "";
+    setTemplateSuggestionsVisible(false);
+    return;
+  }
+
+  const req = db
+    .transaction(["templates"], "readonly")
+    .objectStore("templates")
+    .getAll();
+
+  req.onsuccess = async () => {
+    const templates = await decryptRecords(req.result || []);
+
+    const matches = templates
+      .filter((template) => templateMatchesIssue(template, searchContext))
+      .slice(0, 8);
+
+    if (!matches.length) {
+      container.innerHTML = "";
+      setTemplateSuggestionsVisible(false);
+      return;
+    }
+
+    container.innerHTML = matches
+      .map((template) => {
+        const meta = [
+          template.deviceTypes?.join(", "),
+          template.userTypes?.join(", "),
+          template.deviation,
+        ]
+          .filter(Boolean)
+          .join(" | ");
+        const preview =
+          template.troubleshooting || "No troubleshooting notes saved.";
+
+        return `
+          <button
+            type="button"
+            class="template-suggestion"
+            onclick="applyTemplate('${template.id}')"
+          >
+            <span>
+              <strong>${escapeHtml(getTemplateDisplayTitle(template))}</strong>
+              <small>${escapeHtml(meta)}</small>
+
+            </span>
+            <i class="fa-solid fa-wand-magic-sparkles"></i>
+          </button>
+        `;
+      })
+      .join("");
+
+    setTemplateSuggestionsVisible(true);
+  };
+}
+
+function applyTemplate(templateId) {
+  if (!db) return;
+
+  const readTx = db.transaction(["templates"], "readonly");
+  const req = readTx.objectStore("templates").get(templateId);
+
+  req.onsuccess = async () => {
+    const template = await decryptRecord(req.result);
+
+    if (!template) return;
+
+    $("troubleshooting").value = template.troubleshooting || "";
+    $("issueTitle").value = template.issueTitle || "";
+    autoResizeTextarea($("troubleshooting"));
+    template.usageCount = (template.usageCount || 0) + 1;
+    template.lastUsedAt = new Date().toISOString();
+    template.updatedAt = template.updatedAt || template.lastUsedAt;
+    const encryptedTemplate = await encryptRecord(template);
+    const writeTx = db.transaction(["templates"], "readwrite");
+    writeTx.objectStore("templates").put(encryptedTemplate);
+
+    triggerAutoSave();
+    updateCurrentIssueTitle();
+    updateFilledFieldHighlights();
+    updatePreview();
+    // showMessage("Template applied", "success");
+  };
+}
+
+function applyTemplateFromDrawer(templateId) {
+  applyTemplate(templateId);
+  closeDrawers();
+}
+
+function splitTemplateValues(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function setTemplateModalMode(mode) {
+  const isNew = mode === "new";
+
+  $("templateModalTitle").textContent = isNew
+    ? "Add Template"
+    : "Edit Template";
+  $("templateModalSubtitle").textContent = isNew
+    ? "Create a saved suggestion manually."
+    : "Update the saved suggestion details.";
+  $("templateModalSaveBtn").querySelector("span").textContent = isNew
+    ? "Save Template"
+    : "Save Changes";
+}
+
+function resetTemplateEditorFields() {
+  [
+    "editTemplateName",
+    "editTemplateIssueTitle",
+    "editTemplateObject",
+    "editTemplateDeviation",
+    "editTemplateDeviceTypes",
+    "editTemplateOs",
+    "editTemplateUserTypes",
+    "editTemplateTroubleshooting",
+  ].forEach((id) => {
+    $(id).value = "";
+  });
+  refreshCustomSelects($("templateEditModal"));
+}
+
+function readTemplateEditorData(existingTemplate = {}) {
+  const name = $("editTemplateName").value.trim();
+  const issueTitle = $("editTemplateIssueTitle").value.trim();
+  const troubleshooting = $("editTemplateTroubleshooting").value.trim();
+  const deviceType = $("editTemplateDeviceTypes").value;
+  const os = $("editTemplateOs").value;
+  const userType = $("editTemplateUserTypes").value;
+  const now = new Date().toISOString();
+
+  return {
+    ...existingTemplate,
+    id:
+      existingTemplate.id ||
+      `template-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    issueTitle,
+    issueKeywords: getTemplateKeywords(issueTitle),
+    object: $("editTemplateObject").value.trim(),
+    deviation: $("editTemplateDeviation").value.trim(),
+    deviceTypes: deviceType ? [deviceType] : [],
+    os: os ? [os] : [],
+    userTypes: userType ? [userType] : [],
+    troubleshooting,
+    usageCount: existingTemplate.usageCount || 0,
+    lastUsedAt: existingTemplate.lastUsedAt || null,
+    createdAt: existingTemplate.createdAt || now,
+    updatedAt: now,
+  };
+}
+
+function openNewTemplate() {
+  editingTemplateId = null;
+  setTemplateModalMode("new");
+  resetTemplateEditorFields();
+  $("templateEditModal").classList.remove("hidden");
+  $("editTemplateName").focus();
+}
+
+function openEditTemplate(templateId) {
+  if (!db) return;
+
+  const req = db
+    .transaction(["templates"], "readonly")
+    .objectStore("templates")
+    .get(templateId);
+
+  req.onsuccess = async () => {
+    const template = await decryptRecord(req.result);
+    if (!template) {
+      // showMessage("Template not found", "error");
+      return;
+    }
+
+    editingTemplateId = template.id;
+    setTemplateModalMode("edit");
+    $("editTemplateName").value = template.name || template.issueTitle || "";
+    $("editTemplateIssueTitle").value =
+      template.issueTitle || template.name || "";
+    $("editTemplateObject").value = template.object || "";
+    $("editTemplateDeviation").value = template.deviation || "";
+    $("editTemplateDeviceTypes").value = template.deviceTypes?.[0] || "";
+    $("editTemplateOs").value = template.os?.[0] || "";
+    $("editTemplateUserTypes").value = template.userTypes?.[0] || "";
+    $("editTemplateTroubleshooting").value = template.troubleshooting || "";
+    refreshCustomSelects($("templateEditModal"));
+    $("templateEditModal").classList.remove("hidden");
+    $("editTemplateName").focus();
+  };
+}
+
+function closeEditTemplateModal() {
+  editingTemplateId = null;
+  $("templateEditModal").classList.add("hidden");
+}
+
+async function saveEditedTemplate(btn) {
+  if (!db) return;
+
+  const name = $("editTemplateName").value.trim();
+  const issueTitle = $("editTemplateIssueTitle").value.trim();
+  const troubleshooting = $("editTemplateTroubleshooting").value.trim();
+
+  if (!name || !issueTitle || !troubleshooting) {
+    // showMessage(
+    //   "Template name, Short Description, and TS notes are required",
+    //   "error",
+    // );
+    return;
+  }
+
+  let nextTemplate = null;
+
+  if (editingTemplateId) {
+    const records = await getObjectStoreRecords("templates");
+    const template = records.find((record) => record.id === editingTemplateId);
+    if (!template) {
+      // showMessage("Template not found", "error");
+      return;
+    }
+    nextTemplate = readTemplateEditorData(template);
+  } else {
+    nextTemplate = readTemplateEditorData();
+  }
+
+  const encryptedTemplate = await encryptRecord(nextTemplate);
+  const tx = db.transaction(["templates"], "readwrite");
+  tx.objectStore("templates").put(encryptedTemplate);
+
+  tx.oncomplete = () => {
+    const savedLabel = editingTemplateId ? "Saved" : "Added";
+    animateButtonSuccess(btn, savedLabel);
+    closeEditTemplateModal();
+    loadTemplates();
+    updateTemplateSuggestions();
+  };
+}
+
+function deleteTemplate(id, name) {
+  if (!db) return;
+  if (!confirm(`Delete template ${name || id}?`)) return;
+
+  const tx = db.transaction(["templates"], "readwrite");
+  tx.objectStore("templates").delete(id);
+  tx.oncomplete = () => {
+    loadTemplates();
+    updateTemplateSuggestions();
+  };
+}
+
+function loadTemplates() {
+  if (!db) return;
+
+  const list = $("templateList");
+  const searchBox = $("templateSearchBox");
+
+  if (!list || !searchBox) return;
+
+  const q = searchBox.value.trim().toUpperCase();
+  const req = db
+    .transaction(["templates"], "readonly")
+    .objectStore("templates")
+    .getAll();
+
+  req.onsuccess = async () => {
+    const templates = (await decryptRecords(req.result || []))
+      .filter((template) => {
+        const searchableFields = [
+          getTemplateDisplayTitle(template),
+          template.object,
+          template.deviation,
+          template.deviceTypes?.join(" "),
+          template.os?.join(" "),
+          template.userTypes?.join(" "),
+          template.issueKeywords?.join(" "),
+        ];
+
+        return searchableFields.some((field) =>
+          String(field || "")
+            .toUpperCase()
+            .includes(q),
+        );
+      })
+      .sort((a, b) => {
+        const dateA = new Date(
+          a.lastUsedAt || a.updatedAt || a.createdAt || 0,
+        ).getTime();
+        const dateB = new Date(
+          b.lastUsedAt || b.updatedAt || b.createdAt || 0,
+        ).getTime();
+        return dateB - dateA;
+      });
+
+    if (!templates.length) {
+      list.innerHTML =
+        '<div class="small" style="padding:10px;">No templates found...</div>';
+      return;
+    }
+
+    list.innerHTML = templates
+      .map((template) => {
+        const meta = [
+          template.userTypes?.join(", "),
+          template.deviceTypes?.join(", "),
+          template.object,
+          template.deviation,
+        ]
+          .filter(Boolean)
+          .join(" | ");
+
+        return `
+                <div class="template-card">
+                  <div class="template-card-header">
+                    <div class="template-card-heading">
+                      <div class="template-card-title">${escapeHtml(getTemplateDisplayTitle(template))}</div>
+                    </div>
+                  </div>
+                  <div class="template-card-meta">${escapeHtml(meta || template.issueTitle || "No metadata")}</div>
+                 <!-- <div class="template-card-preview">${escapeHtml(template.troubleshooting || "No TS notes saved.")}</div> -->
+                  <div class="template-card-actions">
+                    <button type="button" class="template-apply-btn" onclick="applyTemplateFromDrawer('${template.id}')">
+                      <i class="fa-solid fa-wand-magic-sparkles"></i>
+                      Apply
+                    </button>
+                    <button
+                      type="button"
+                      class="template-edit-btn"
+                      title="Edit template"
+                      onclick="openEditTemplate('${template.id}')"
+                    >
+                      <i class="fa-solid fa-pen-to-square"></i>
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      class="template-delete-btn"
+                      title="Delete template"
+                      onclick="deleteTemplate('${template.id}', '${escapeHtml(getTemplateDisplayTitle(template))}')"
+                    >
+                      <i class="fa-solid fa-trash"></i>
+                    </button>
+                  </div>
+                </div>
+              `;
+      })
+      .join("");
+  };
+}
+
+/* ==========================================================
+   IMS
+   ========================================================== */
+
+/* ==========================================================
+   INCIDENTS
+   ========================================================== */
+
+/* ==========================================================
+   RESOLUTION
+   ========================================================== */
+
+/* ==========================================================
+   DYNAMIC DEVICES
+   ========================================================== */
+
+/* ----------------------------------------------------------
+   SCANNERS
+   ---------------------------------------------------------- */
+
+function renderScannerBlocks() {
+  const savedScanners = currentTicket?.inc?.scanners;
+
+  const scanners =
+    savedScanners && savedScanners.length
+      ? savedScanners
+      : [
+          {
+            scannerNumber: "",
+            receiptPrinterNumber: "",
+          },
+        ];
+
+  return `
+          <h4>Scanner/Printer Details</h4>
+
+          <div id="scannerBlocks">
+            ${scanners
+              .map(
+                (scanner, index) => `
+                  <div class="scanner-block" data-index="${index}">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                      <h5>Scanner/Printer ${index + 1}</h5>
+
+                      ${
+                        scanners.length > 1
+                          ? `
+                        <button
+                          type="button"
+                          class="danger"
+                          onclick="removeScannerBlock(${index})"
+                          style="width:auto;padding:8px 14px;"
+                        >
+                          Remove
+                        </button>
+                      `
+                          : ""
+                      }
+                    </div>
+
+                    
+                    <input
+                      class="scanner-number"
+                      placeholder="Scanner Number (SSE)"
+                      value="${escapeHtml(scanner.scannerNumber || "")}"
+                    >
+
+                    <input
+                      class="receipt-printer-number"
+                      placeholder="Receipt Printer Number (SRNE)"
+                      value="${escapeHtml(scanner.receiptPrinterNumber || "")}"
+                    >
+                    </div>
+                
+                `,
+              )
+              .join("")}
+          </div>
+
+          <button
+            type="button"
+            onclick="addScannerBlock()"
+            class="add-btn"
+          >
+            + Add Scanner
+          </button>
+        `;
+}
+
+function syncScannerBlocksToState() {
+  if (!currentTicket) return;
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  const blocks = [...document.querySelectorAll(".scanner-block")];
+
+  if (!blocks.length) return;
+
+  currentTicket.inc.scanners = blocks.map((block) => ({
+    scannerNumber: block.querySelector(".scanner-number")?.value || "",
+
+    receiptPrinterNumber:
+      block.querySelector(".receipt-printer-number")?.value || "",
+  }));
+}
+
+function removeScannerBlock(index) {
+  if (!currentTicket?.inc?.scanners) return;
+
+  syncScannerBlocksToState();
+
+  currentTicket.inc.scanners.splice(index, 1);
+
+  if (currentTicket.inc.scanners.length === 0) {
+    currentTicket.inc.scanners.push({
+      scannerNumber: "",
+      receiptPrinterNumber: "",
+    });
+  }
+
+  renderDynamicFields();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function addScannerBlock() {
+  if (!currentTicket) return;
+
+  syncScannerBlocksToState();
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  if (!currentTicket.inc.scanners) {
+    currentTicket.inc.scanners = [];
+  }
+
+  currentTicket.inc.scanners.push({
+    scannerNumber: "",
+    receiptPrinterNumber: "",
+  });
+
+  renderDynamicFields();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function syncScannerFieldsToState() {
+  if (!currentTicket?.inc) return;
+
+  currentTicket.inc.scannerNumber = $("scannerNumber")?.value || "";
+  currentTicket.inc.receiptPrinterNumber =
+    $("receiptPrinterNumber")?.value || "";
+}
+
+/* ----------------------------------------------------------
+   PRINTERS
+   ---------------------------------------------------------- */
+
+function renderPrinterBlocks() {
+  const savedPrinters = currentTicket?.inc?.printers;
+  const printers =
+    savedPrinters && savedPrinters.length
+      ? savedPrinters
+      : [
+          {
+            makeModel: "",
+            ip: "",
+            serial: "",
+          },
+        ];
+
+  return `
+               <h4>Printer Details</h4>
+               <div id="printerBlocks">
+                 ${printers
+                   .map(
+                     (printer, index) => `
+                       <div class="printer-block" data-index="${index}">
+                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                           <h5>Printer ${index + 1}</h5>
+
+                           ${
+                             printers.length > 1
+                               ? `
+                             <button
+                               type="button"
+                               class="danger"
+                               onclick="removePrinterBlock(${index})"
+                               style="width:auto;padding:8px 14px;"
+                             >
+                               Remove
+                             </button>
+                           `
+                               : ""
+                           }
+                         </div>
+
+                          <div class="combobox-field">
+                            <input
+                              id="printerMakeModel${index}"
+                              class="printer-make"
+                              placeholder="Make & Model"
+                              value="${escapeHtml(printer.makeModel || "")}"
+                              autocomplete="off"
+                              role="combobox"
+                              aria-autocomplete="list"
+                              aria-expanded="false"
+                              aria-controls="printerMakeModel${index}Options"
+                            >
+                            <div
+                              id="printerMakeModel${index}Options"
+                              class="combobox-options hidden"
+                              role="listbox"
+                            ></div>
+                          </div>
+
+                         <input
+                           class="printer-ip"
+                           placeholder="Printer IP Address"
+                           value="${escapeHtml(printer.ip || "")}"
+                         >
+
+                         <input
+                           class="printer-serial"
+                           placeholder="Printer Serial Number"
+                           value="${escapeHtml(printer.serial || "")}"
+                         >
+                         </div>
+                      
+                     `,
+                   )
+                   .join("")}
+               </div>
+
+               <button
+                 type="button"
+                 onclick="addPrinterBlock()"
+                 class="add-btn"
+               >
+                 + Add Printer
+               </button>
+             `;
+}
+
+function syncPrinterBlocksToState() {
+  if (!currentTicket) return;
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  const blocks = [...document.querySelectorAll(".printer-block")];
+
+  // Don't overwrite saved data if printer UI is hidden
+  if (!blocks.length) return;
+
+  currentTicket.inc.printers = blocks.map((block) => ({
+    makeModel: block.querySelector(".printer-make")?.value || "",
+    ip: block.querySelector(".printer-ip")?.value || "",
+    serial: block.querySelector(".printer-serial")?.value || "",
+  }));
+}
+
+function addPrinterBlock() {
+  if (!currentTicket) return;
+
+  syncPrinterBlocksToState();
+
+  if (!currentTicket.inc.printers) {
+    currentTicket.inc.printers = [];
+  }
+
+  currentTicket.inc.printers.push({
+    makeModel: "",
+    ip: "",
+    serial: "",
+  });
+
+  renderDynamicFields();
+  refreshDynamicEscalationLists();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function removePrinterBlock(index) {
+  if (!currentTicket?.inc?.printers) return;
+
+  syncPrinterBlocksToState();
+
+  currentTicket.inc.printers.splice(index, 1);
+
+  currentTicket.inc.selectedEscalationPrinters = [];
+
+  if (currentTicket.inc.printers.length === 0) {
+    currentTicket.inc.printers.push({
+      makeModel: "",
+      ip: "",
+      serial: "",
+    });
+  }
+
+  renderDynamicFields();
+  refreshDynamicEscalationLists();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function renderPrinterSelectionList() {
+  const container = $("printerSelectionList");
+
+  if (!container) return;
+
+  const printers = currentTicket?.inc?.printers || [];
+
+  if (!printers.length) {
+    container.innerHTML = `
+                 <div class="small">No printer details available.</div>
+               `;
+    return;
+  }
+
+  const selected = currentTicket?.inc?.selectedEscalationPrinters || [];
+
+  container.innerHTML = `
+               <h4>Select Printer(s) to Escalate</h4>
+            ${printers
+              .map(
+                (printer, index) => `
+                   <div
+                     class="printer-select-item ${
+                       selected.includes(index) ? "active" : ""
+                     }"
+                     onclick="toggleEscalationPrinter(${index})"
+                   >
+                     <div class="printer-meta">
+                       <div class="printer-title">
+                         Printer ${index + 1}
+                       </div>
+
+                       <div class="printer-subtitle">
+                         ${escapeHtml(printer.makeModel || "Unknown Model")}
+                       </div>
+
+                       <div class="printer-ip">
+                         ${escapeHtml(printer.ip || "No IP Address")}
+                       </div>
+                     </div>
+                   </div>
+                 `,
+              )
+              .join("")}
+             `;
+}
+
+function toggleEscalationPrinter(index) {
+  if (!currentTicket?.inc) return;
+
+  if (!currentTicket.inc.selectedEscalationPrinters) {
+    currentTicket.inc.selectedEscalationPrinters = [];
+  }
+
+  const selected = currentTicket.inc.selectedEscalationPrinters;
+
+  if (selected.includes(index)) {
+    currentTicket.inc.selectedEscalationPrinters = selected.filter(
+      (i) => i !== index,
+    );
+  } else {
+    selected.push(index);
+  }
+
+  renderPrinterSelectionList();
+  updatePreview();
+  triggerAutoSave();
+}
+
+/* ----------------------------------------------------------
+   EQUIPMENT
+   ---------------------------------------------------------- */
+
+function renderEquipmentBlocks() {
+  const saved = currentTicket?.inc?.equipment;
+  const equipment =
+    saved && saved.length
+      ? saved
+      : [
+          {
+            type: "",
+            makeModel: "",
+            serial: "",
+          },
+        ];
+
+  return `
+               <h4>Asset Details</h4>
+
+               <div id="equipmentBlocks">
+                 ${equipment
+                   .map(
+                     (item, index) => `
+                       <div class="equipment-block" data-index="${index}">
+                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                           <h5>Device ${index + 1}</h5>
+
+                           ${
+                             equipment.length > 1
+                               ? `
+                               <button
+                                 type="button"
+                                 class="danger"
+                                 onclick="removeEquipmentBlock(${index})"
+                                 style="width:auto;padding:8px 14px;"
+                               >
+                                 Remove
+                               </button>
+                             `
+                               : ""
+                           }
+                         </div>
+
+                          <div class="combobox-field">
+                            <input
+                              id="equipmentType${index}"
+                              class="equipment-type"
+                              placeholder="Device Type"
+                              value="${escapeHtml(item.type || "")}"
+                              autocomplete="off"
+                              role="combobox"
+                              aria-autocomplete="list"
+                              aria-expanded="false"
+                              aria-controls="equipmentType${index}Options"
+                            >
+                            <div
+                              id="equipmentType${index}Options"
+                              class="combobox-options hidden"
+                              role="listbox"
+                            ></div>
+                          </div>
+                         <input
+                           class="equipment-make"
+                           placeholder="Make & Model"
+                           value="${escapeHtml(item.makeModel || "")}"
+                         >
+                         <input
+                           class="equipment-serial"
+                           placeholder="Serial Number / Asset Tag"
+                           value="${escapeHtml(item.serial || "")}"
+                         >
+                       </div>
+                     `,
+                   )
+                   .join("")}
+               </div>
+
+               <button
+                 type="button"
+                 class="add-btn"
+                 onclick="addEquipmentBlock()"
+               >
+                 + Add Device
+               </button>
+             `;
+}
+
+function syncEquipmentBlocksToState() {
+  if (!currentTicket?.inc) return;
+
+  const blocks = [...document.querySelectorAll(".equipment-block")];
+
+  if (!blocks.length) return;
+
+  currentTicket.inc.equipment = blocks.map((block) => ({
+    type: block.querySelector(".equipment-type")?.value || "",
+    makeModel: block.querySelector(".equipment-make")?.value || "",
+    serial: block.querySelector(".equipment-serial")?.value || "",
+  }));
+}
+
+function addEquipmentBlock() {
+  if (!currentTicket) return;
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  syncEquipmentBlocksToState();
+
+  if (!currentTicket.inc.equipment) {
+    currentTicket.inc.equipment = [];
+  }
+
+  currentTicket.inc.showEquipmentFields = true;
+
+  currentTicket.inc.equipment.push({
+    type: "",
+    makeModel: "",
+    serial: "",
+  });
+
+  renderDynamicFields();
+  refreshDynamicEscalationLists();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function removeEquipmentBlock(index) {
+  if (!currentTicket?.inc?.equipment) return;
+
+  syncEquipmentBlocksToState();
+
+  currentTicket.inc.equipment.splice(index, 1);
+
+  currentTicket.inc.selectedEscalationEquipment = [];
+
+  if (currentTicket.inc.equipment.length === 0) {
+    currentTicket.inc.equipment.push({
+      type: "",
+      makeModel: "",
+      serial: "",
+    });
+  }
+
+  renderDynamicFields();
+  refreshDynamicEscalationLists();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function renderEquipmentSelectionList() {
+  const container = $("equipmentSelectionList");
+
+  if (!container) return;
+
+  syncEquipmentBlocksToState();
+
+  const equipment = currentTicket?.inc?.equipment || [];
+
+  if (!equipment.length) {
+    container.innerHTML = `
+                 <div class="small">No Asset Details available.</div>
+               `;
+    return;
+  }
+
+  const selected = currentTicket?.inc?.selectedEscalationEquipment || [];
+
+  container.innerHTML = `
+               <h4>Select Asset(s) To Escalate</h4>
+            ${equipment
+              .map(
+                (device, index) => `
+                   <div
+                     class="equipment-select-item ${
+                       selected.includes(index) ? "active" : ""
+                     }"
+                     onclick="toggleEscalationEquipment(${index})"
+                   >
+                     <div class="equipment-meta">
+                       <div class="equipment-title">
+                         Device ${index + 1}: ${escapeHtml(device.type || "Equipment")}
+                       </div>
+
+                       <div class="equipment-subtitle">
+                         ${escapeHtml(device.makeModel || "Unknown Model")}
+                       </div>
+
+                       <div class="equipment-serial">
+                         ${escapeHtml(device.serial || "No Serial Number")}
+                       </div>
+                     </div>
+                   </div>
+                 `,
+              )
+              .join("")}
+             `;
+}
+
+function toggleEscalationEquipment(index) {
+  if (!currentTicket?.inc) return;
+
+  if (!currentTicket.inc.selectedEscalationEquipment) {
+    currentTicket.inc.selectedEscalationEquipment = [];
+  }
+
+  const selected = currentTicket.inc.selectedEscalationEquipment;
+
+  if (selected.includes(index)) {
+    currentTicket.inc.selectedEscalationEquipment = selected.filter(
+      (i) => i !== index,
+    );
+  } else {
+    selected.push(index);
+  }
+
+  renderEquipmentSelectionList();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function renderDynamicFields() {
+  if (!currentTicket) return;
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  if (currentTicket.inc.showScannerFields === undefined) {
+    currentTicket.inc.showScannerFields = false;
+  }
+
+  if (currentTicket.inc.showPrinterFields === undefined) {
+    currentTicket.inc.showPrinterFields = false;
+  }
+
+  if (currentTicket.inc.showEquipmentFields === undefined) {
+    currentTicket.inc.showEquipmentFields = false;
+  }
+
+  $("toggleScanner")?.classList.toggle(
+    "active",
+    currentTicket.inc.showScannerFields,
+  );
+
+  $("togglePrinter")?.classList.toggle(
+    "active",
+    currentTicket.inc.showPrinterFields,
+  );
+
+  $("toggleEquipment")?.classList.toggle(
+    "active",
+    currentTicket.inc.showEquipmentFields,
+  );
+
+  let html = "";
+
+  if (currentTicket.inc.showScannerFields) {
+    html += renderScannerBlocks();
+  }
+
+  if (currentTicket.inc.showPrinterFields) {
+    html += renderPrinterBlocks();
+  }
+
+  if (currentTicket.inc.showEquipmentFields) {
+    html += renderEquipmentBlocks();
+  }
+
+  $("dynamicIssueFields").innerHTML = html;
+  initPrinterMakeModelComboboxes();
+  initAssetTypeComboboxes();
+  if (!$("dsvFields").classList.contains("hidden")) {
+    renderEquipmentSelectionList();
+  }
+}
+
+function refreshDynamicEscalationLists() {
+  const status = $("ticketStatus").value;
+
+  if (status === "Printer Escalate") {
+    renderPrinterSelectionList();
+  }
+
+  if (status === "DSV" || status === "WTF - DSV Warm Handoff") {
+    renderEquipmentSelectionList();
+  }
+}
+function updateStatusFields() {
+  const status = $("ticketStatus").value;
+
+  const showEsc = status === "Escalate" || status === "Printer Escalate";
+  $("escalationFields").classList.toggle("hidden", !showEsc);
+  $("escalationNotes").style.display =
+    status === "Escalate" || status === "CRE" ? "block" : "none";
+
+  const showDSV = status === "DSV" || status === "WTF - DSV Warm Handoff";
+  $("dsvFields").classList.toggle("hidden", !showDSV);
+
+  if (showDSV) {
+    renderEquipmentSelectionList();
+  }
+
+  const showPrinter = status === "Printer Escalate";
+  $("printerEscalationFields").classList.toggle("hidden", !showPrinter);
+
+  if (showPrinter) {
+    renderPrinterSelectionList();
+  }
+
+  $("officeAddress").style.display = showPrinter || showDSV ? "block" : "none";
+  $("makeModel").style.display = showDSV ? "block" : "none";
+  $("homeAddress").style.display = showDSV ? "block" : "none";
+
+  const showOpen = status === "Open";
+  $("openFields").classList.toggle("hidden", !showOpen);
+
+  const openReason = $("openReason")?.value || "";
+  const showBusy = status === "Open" && openReason === "Busy";
+
+  $("busyFields").classList.toggle("hidden", !showBusy);
+
+  const showCopyFollowUp = status === "Open";
+  $("copyFollowUpBtn").classList.toggle("hidden", !showCopyFollowUp);
+
+  const showResolution =
+    status === "Resolved" ||
+    status === "Self Resolved" ||
+    status === "Information" ||
+    status === "Status";
+  $("resolutionPanel").classList.toggle("hidden", !showResolution);
+
+  autoResizeTicketTextareas();
+}
+
+/* ==========================================================
+   FOLLOW UPS
+   ========================================================== */
+const followUpMethodResponses = {
+  Teams: ["Busy", "Offline", "No Response", "Responded"],
+  Email: ["Email Sent", "No Response", "User Replied"],
+  Call: ["No Answer", "Went to voicemail", "Callback Requested", "Connected"],
+};
+
+const followUpMethodNames = Object.keys(followUpMethodResponses);
+
+function normalizeFollowUp(followUp = {}) {
+  const methods = { ...(followUp.methods || {}) };
+  const legacyStatus = followUp.status || "";
+
+  if (!Object.keys(methods).length && legacyStatus) {
+    const legacyMap = {
+      "Teams - Busy": ["Teams", "Busy"],
+      "User Busy": ["Teams", "Busy"],
+      "Teams - Offline": ["Teams", "Offline"],
+      "No Response on Teams": ["Teams", "No Response"],
+      "Email sent": ["Email", "Email Sent"],
+      "Email Sent": ["Email", "Email Sent"],
+      "No answer": ["Call", "No Answer"],
+      "No Answer": ["Call", "No Answer"],
+      "Call went to voicemail": ["Call", "Went to voicemail"],
+      "Callback requested": ["Call", "Callback Requested"],
+      "Callback Requested": ["Call", "Callback Requested"],
+    };
+    const mapped = legacyMap[legacyStatus];
+
+    if (mapped) {
+      methods[mapped[0]] = mapped[1];
+    }
+  }
+
+  return {
+    ...followUp,
+    methods,
+    actionTaken: followUp.actionTaken || "",
+  };
+}
+
+function renderFollowUpMethodControls(followUp, index) {
+  const methods = followUp.methods || {};
+  const buttons = followUpMethodNames
+    .map((method) => {
+      const isActive = Object.prototype.hasOwnProperty.call(methods, method);
+      return `
+        <button
+          type="button"
+          class="followup-method-btn ${isActive ? "active" : ""}"
+          onclick="toggleFollowUpMethod(${index}, '${method}')"
+        >
+          ${method}
+        </button>
+      `;
+    })
+    .join("");
+
+  const responses = followUpMethodNames
+    .filter((method) => Object.prototype.hasOwnProperty.call(methods, method))
+    .map((method) => {
+      const currentValue = methods[method] || "";
+      return `
+        <div class="followup-response-row">
+          <h6>${method}</h6>
+          
+          <select class="followup-method-response" data-method="${method}">
+            <option value="" selected disabled>Select ${method} response</option>
+            ${followUpMethodResponses[method]
+              .map(
+                (response) => `
+                  <option value="${response}" ${
+                    currentValue === response ? "selected" : ""
+                  }>${response}</option>
+                `,
+              )
+              .join("")}
+          </select>
+
+        </div>
+      `;
+    })
+    .join("");
+
+  return `
+    <div class="followup-method-grid">${buttons}</div>
+    <div class="followup-response-grid">${responses}</div>
+  `;
+}
+
+function getFollowUpFromBlock(block) {
+  const methods = {};
+
+  block.querySelectorAll(".followup-method-response").forEach((select) => {
+    if (select.dataset.method) {
+      methods[select.dataset.method] = select.value || "";
+    }
+  });
+
+  return {
+    methods,
+    actionTaken: block.querySelector(".followup-notes")?.value || "",
+  };
+}
+
+function renderFollowUpFields() {
+  const status = $("ticketStatus").value;
+
+  const needsFollowUp = status === "Open";
+
+  if (!needsFollowUp) {
+    $("followUpFields").innerHTML = "";
+    return;
+  }
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  const savedFollowUps = currentTicket.inc.followUps;
+
+  const followUps =
+    savedFollowUps && savedFollowUps.length
+      ? savedFollowUps.map(normalizeFollowUp)
+      : [
+          {
+            methods: {},
+            actionTaken: "",
+          },
+        ];
+
+  $("followUpFields").innerHTML = `
+          <h4>Follow-Up Attempts</h4>
+
+          <div id="followUpBlocks">
+            ${followUps
+              .map(
+                (followUp, index) => `
+                  <div class="followup-block" data-index="${index}">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                      <h5>Attempt ${index + 1}</h5>
+
+                      ${
+                        followUps.length > 1
+                          ? `
+                        <button
+                          type="button"
+                          class="danger"
+                          onclick="removeFollowUpBlock(${index})"
+                          style="width:auto;padding:8px 14px;"
+                        >
+                          Remove
+                        </button>
+                      `
+                          : ""
+                      }
+                    </div>
+
+                    ${renderFollowUpMethodControls(followUp, index)}
+
+                    <textarea
+                      class="followup-notes"
+                      placeholder="Enter follow-up notes"
+                       oninput="autoResizeTextarea(this)"
+                    >${escapeHtml(followUp.actionTaken || "")}</textarea>
+                  </div>
+                `,
+              )
+              .join("")}
+          </div>
+
+          <button
+              type="button"
+              onclick="addFollowUpBlock()"
+              class="add-btn"
+            >
+              + Add Follow-Up
+            </button>
+        `;
+
+  initCustomSelects($("followUpFields"));
+
+  document.querySelectorAll(".followup-notes").forEach(autoResizeTextarea);
+}
+
+function syncFollowUpBlocksToState() {
+  if (!currentTicket) return;
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  const blocks = [...document.querySelectorAll(".followup-block")];
+
+  if (!blocks.length) return;
+
+  currentTicket.inc.followUps = blocks.map(getFollowUpFromBlock);
+}
+
+function toggleFollowUpMethod(index, method) {
+  if (!currentTicket) return;
+
+  syncFollowUpBlocksToState();
+
+  if (!currentTicket.inc.followUps?.[index]) return;
+
+  const followUp = normalizeFollowUp(currentTicket.inc.followUps[index]);
+  const methods = followUp.methods || {};
+
+  if (Object.prototype.hasOwnProperty.call(methods, method)) {
+    delete methods[method];
+  } else {
+    methods[method] = "";
+  }
+
+  currentTicket.inc.followUps[index] = {
+    ...followUp,
+    methods,
+  };
+
+  renderFollowUpFields();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function addFollowUpBlock() {
+  if (!currentTicket) return;
+
+  syncFollowUpBlocksToState();
+
+  if (!currentTicket.inc.followUps) {
+    currentTicket.inc.followUps = [];
+  }
+
+  // if (currentTicket.inc.followUps.length >= 3) return;
+
+  currentTicket.inc.followUps.push({
+    methods: {},
+    actionTaken: "",
+  });
+
+  renderFollowUpFields();
+  updatePreview();
+  triggerAutoSave();
+}
+
+function removeFollowUpBlock(index) {
+  if (!currentTicket?.inc?.followUps) return;
+
+  syncFollowUpBlocksToState();
+
+  currentTicket.inc.followUps.splice(index, 1);
+
+  if (currentTicket.inc.followUps.length === 0) {
+    currentTicket.inc.followUps.push({
+      methods: {},
+      actionTaken: "",
+    });
+  }
+
+  renderFollowUpFields();
+  updatePreview();
+  triggerAutoSave();
+}
+
+/* ==========================================================
+   NOTE GENERATORS
+   ========================================================== */
+
+/* ==========================================================
+   COPY FUNCTIONS
+   ========================================================== */
+
+/* ==========================================================
+   PREVIEW
+   ========================================================== */
+
+/* ==========================================================
+   STARTUP
+   ========================================================== */
+
+function autoResizeTextarea(el) {
+  if (!el) return;
+
+  el.style.overflowY = "hidden";
+
+  if (el.offsetParent === null) return;
+
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight}px`;
+}
+
+const autoResizeTicketTextareaSelector =
+  "#troubleshooting, #busyNotes, #escalationNotes, .followup-notes";
+
+function autoResizeTicketTextareas(scope = document) {
+  requestAnimationFrame(() => {
+    const root = scope.querySelectorAll ? scope : document;
+
+    root
+      .querySelectorAll(autoResizeTicketTextareaSelector)
+      .forEach(autoResizeTextarea);
+  });
+}
+
+function getResolutionData() {
+  return {
+    rootfix: $("resolutionRootFix")?.value || "",
+    application: $("resolutionApplication")?.value || "",
+    environment: $("resolutionEnvironment")?.value || "",
+  };
+}
+
+function setResolutionData(resolution = {}) {
+  if ($("resolutionRootFix")) {
+    $("resolutionRootFix").value = resolution.rootfix || "";
+  }
+
+  if ($("resolutionApplication")) {
+    $("resolutionApplication").value = resolution.application || "";
+  }
+
+  if ($("resolutionEnvironment")) {
+    $("resolutionEnvironment").value =
+      resolution.environment || resolution.envirnoment || "";
+  }
+}
+
+function generateResolutionNote() {
+  const resolution = getResolutionData();
+  const header = [
+    resolution.rootfix,
+    resolution.application,
+    resolution.environment,
+  ]
+    .filter((v) => v && v.trim())
+    .join(" - ");
+  return [header, "", formatTroubleshooting($("troubleshooting").value)].join(
+    "\n",
+  );
+}
+
+document.addEventListener("input", (e) => {
+  if (e.target.closest("#templateEditModal")) return;
+
+  if (
+    e.target.matches("input") ||
+    e.target.matches("textarea") ||
+    e.target.matches("select")
+  ) {
+    if (e.target.matches(autoResizeTicketTextareaSelector)) {
+      autoResizeTextarea(e.target);
+    }
+
+    // sync dynamic device blocks live
+    if (e.target.closest(".printer-block")) {
+      syncPrinterBlocksToState();
+      refreshDynamicEscalationLists();
+    }
+
+    if (e.target.closest(".equipment-block")) {
+      syncEquipmentBlocksToState();
+      refreshDynamicEscalationLists();
+    }
+
+    if (e.target.closest(".scanner-block")) {
+      syncScannerBlocksToState();
+    }
+
+    if (imsRequiredFieldIds.includes(e.target.id)) {
+      updateIMSRequiredFieldHighlights();
+    }
+
+    updateFilledFieldHighlights();
+    triggerAutoSave();
+  }
+});
+
+document.addEventListener("change", (e) => {
+  if (
+    e.target.matches("input") ||
+    e.target.matches("textarea") ||
+    e.target.matches("select")
+  ) {
+    updateFilledFieldHighlights();
+  }
+
+  if (!imsRequiredFieldIds.includes(e.target.id)) return;
+
+  updateIMSRequiredFieldHighlights();
+  triggerAutoSave();
+});
+let clickCount = 0;
+let timer;
+
+$("imsTab").addEventListener("click", () => {
+  clickCount++;
+  $("dialogContent").innerHTML = `
+        <div>
+          <p>
+            © 2026 TicketPad<br />
+            <strong>Developed by Padam Gadshila</strong><br />
+            Version 1.0.0
+          </p>
+
+          <p style="font-size: 13px; opacity: 0.8">
+            Thank you for using TicketPad.
+          </p>
+        </div>
+        `;
+  clearTimeout(timer);
+
+  timer = setTimeout(() => {
+    clickCount = 0;
+  }, 500);
+  if (clickCount >= 5) {
+    clickCount = 0;
+    $("copyrightDialog").showModal();
+  }
+});
+$("closeCopyrightBtn").addEventListener("click", () => {
+  $("copyrightDialog").close();
+  $("dialogContent").innerHTML = "";
+});
+function showTab(tab) {
+  if (tab === "inc" && $("incTab").classList.contains("disabled")) {
+    return;
+  }
+
+  $("imsPanel").classList.toggle("hidden", tab !== "ims");
+  $("incPanel").classList.toggle("hidden", tab !== "inc");
+
+  if (tab === "ims") {
+    $("imsTab").classList.add("active");
+    $("incTab").classList.remove("active");
+  } else if (tab === "inc") {
+    $("imsTab").classList.remove("active");
+    $("incTab").classList.add("active");
+    autoResizeTicketTextareas();
+  }
+
+  updateCurrentIssueTitle();
+}
+
+function updateCurrentIssueTitle() {
+  const title = $("issueTitle")?.value.trim() || "";
+  const display = $("currentIssueTitle");
+  if (!display) return;
+  const isIncTabActive = !$("incPanel")?.classList.contains("hidden");
+
+  display.textContent = title;
+  display.classList.toggle("hidden", !title || isIncTabActive);
+}
+
+function togglePriorTicketField() {
+  $("priorTicketNumber").classList.toggle(
+    "hidden",
+    $("priorIssue").value !== "Prior",
+  );
+}
+
+function formatTroubleshooting(text) {
+  if (!text) return "";
+
+  const lines = text.split("\n");
+  const output = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    // blank line
+    if (!line) {
+      output.push("");
+      continue;
+    }
+
+    // section heading
+    if (line.startsWith("#")) {
+      const heading = line.replace(/^#+\s*/, "").trim();
+
+      output.push(heading, "-".repeat(heading.length));
+
+      continue;
+    }
+
+    // cleanup bullets / arrows / dots
+    let clean = line.replace(/^(\-+>|->|[-.•]+)\s*/, "").trim();
+
+    // capitalize first letter
+    if (clean.length) {
+      clean = clean.charAt(0).toUpperCase() + clean.slice(1);
+    }
+
+    // add punctuation if missing
+    if (!/[.!?]$/.test(clean)) {
+      clean += ".";
+    }
+
+    output.push(`-> ${clean}`);
+  }
+
+  return output.join("\n");
+}
+
+function formatLatestFollowUp(text) {
+  if (!text) return "";
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let latestStart = -1;
+
+  // find last "Attempt X"
+  for (let i = 0; i < lines.length; i++) {
+    if (/^attempt\s+\d+$/i.test(lines[i])) {
+      latestStart = i;
+    }
+  }
+
+  // no attempt found
+  if (latestStart === -1) {
+    return formatFollowUp(text);
+  }
+
+  const latestLines = lines.slice(latestStart);
+  const result = [];
+
+  latestLines.forEach((line) => {
+    if (/^attempt\s+\d+$/i.test(line)) {
+      result.push(line);
+    } else {
+      result.push("└── " + line.replace(/^[-\s]+/, ""));
+    }
+  });
+
+  return result.join("\n");
+}
+
+function getIMSData() {
+  const ticketId = $("ticketId").value.trim().toUpperCase();
+  const now = new Date().toISOString();
+  const createdAt =
+    currentTicket?.id === ticketId
+      ? currentTicket.createdAt || currentTicket.updatedAt || now
+      : now;
+
+  return {
+    id: ticketId,
+    ims: {
+      userId: $("userId").value,
+      fullName: $("fullName").value,
+      contact: $("contact").value,
+      userType: $("userType").value,
+      workingHours: $("workingHours").value,
+      os: $("os").value,
+      deviceType: $("deviceType").value,
+      workstationId: $("workstationId").value,
+      object: $("object").value,
+      deviation: $("deviation").value,
+      lastAttempt: $("lastAttempt").value,
+      priorIssue: $("priorIssue").value,
+      priorTicketNumber: $("priorTicketNumber").value,
+      multiuser: $("multiuser").value,
+    },
+    inc: currentTicket?.inc || {},
+    pinned: currentTicket?.pinned || false,
+    createdAt,
+    updatedAt: now,
+  };
+}
+
+function saveINC(btn) {
+  const ticketId = $("ticketId").value.trim().toUpperCase();
+
+  if (!/^(IMS|INC)\d+$/i.test(ticketId)) {
+    return showMessage("Enter valid ticket ID first", "error");
+  }
+
+  persistTicket(buildTicketData(), () => animateButtonSuccess(btn, "✓ Saved"));
+}
+
+function buildTicketData() {
+  const ticketId = $("ticketId").value.trim().toUpperCase();
+  const now = new Date().toISOString();
+  const createdAt =
+    currentTicket?.id === ticketId
+      ? currentTicket.createdAt || currentTicket.updatedAt || now
+      : now;
+
+  return {
+    id: ticketId,
+
+    ims: {
+      userId: $("userId").value,
+      fullName: $("fullName").value,
+      contact: $("contact").value,
+      userType: $("userType").value,
+      workingHours: $("workingHours").value,
+      os: $("os").value,
+      deviceType: $("deviceType").value,
+      workstationId: $("workstationId").value,
+      object: $("object").value,
+      deviation: $("deviation").value,
+      lastAttempt: $("lastAttempt").value,
+      priorIssue: $("priorIssue").value,
+      priorTicketNumber: $("priorTicketNumber").value,
+      multiuser: $("multiuser").value,
+    },
+
+    resolution: getResolutionData(),
+
+    inc: {
+      printerOfficeLocation: $("printerOfficeLocation")?.value || "",
+      issueTitle: $("issueTitle").value,
+      validationRef: $("validationRef").value,
+      troubleshooting: $("troubleshooting").value,
+
+      scanners: document.querySelectorAll(".scanner-block").length
+        ? [...document.querySelectorAll(".scanner-block")].map((block) => ({
+            scannerNumber: block.querySelector(".scanner-number")?.value || "",
+            receiptPrinterNumber:
+              block.querySelector(".receipt-printer-number")?.value || "",
+          }))
+        : currentTicket?.inc?.scanners || [],
+
+      printers: document.querySelectorAll(".printer-block").length
+        ? [...document.querySelectorAll(".printer-block")].map((block) => ({
+            makeModel: block.querySelector(".printer-make")?.value || "",
+            ip: block.querySelector(".printer-ip")?.value || "",
+            serial: block.querySelector(".printer-serial")?.value || "",
+          }))
+        : currentTicket?.inc?.printers || [],
+
+      equipment: document.querySelectorAll(".equipment-block").length
+        ? [...document.querySelectorAll(".equipment-block")].map((block) => ({
+            type: block.querySelector(".equipment-type")?.value || "",
+            makeModel: block.querySelector(".equipment-make")?.value || "",
+            serial: block.querySelector(".equipment-serial")?.value || "",
+          }))
+        : currentTicket?.inc?.equipment || [],
+
+      followUps: document.querySelectorAll(".followup-block").length
+        ? [...document.querySelectorAll(".followup-block")].map(
+            getFollowUpFromBlock,
+          )
+        : currentTicket?.inc?.followUps || [],
+
+      ticketStatus: $("ticketStatus").value,
+      assignmentGroup: $("assignmentGroup").value,
+      escalationNotes: $("escalationNotes").value,
+      makeModel: $("makeModel").value,
+      homeAddress: $("homeAddress").value,
+      officeAddress: $("officeAddress").value,
+
+      selectedEscalationPrinters:
+        currentTicket?.inc?.selectedEscalationPrinters || [],
+      selectedEscalationEquipment:
+        currentTicket?.inc?.selectedEscalationEquipment || [],
+
+      showScannerFields: currentTicket?.inc?.showScannerFields || false,
+      showPrinterFields: currentTicket?.inc?.showPrinterFields || false,
+      showEquipmentFields: currentTicket?.inc?.showEquipmentFields || false,
+      busyReason: $("busyReason")?.value || "",
+      busyNotes: $("busyNotes")?.value || "",
+      openReason: $("openReason")?.value || "",
+    },
+
+    createdAt,
+    updatedAt: now,
+    pinned: currentTicket?.pinned || false,
+  };
+}
+
+const hraProcess = (input) => {
+  const value = (input || "").trim();
+
+  if (/^(fail|failed)$/i.test(value)) {
+    return "HRA Failed";
+  }
+
+  if (/^(done|completed)$/i.test(value)) {
+    return "HRA Done";
+  }
+
+  const ids = value.match(/m?\d+/gi) || [];
+  if (ids.length === 0) {
+    return "NA";
+  }
+  const groups = [];
+
+  ids.forEach((id) => {
+    const isManager = /^m\d+$/i.test(id);
+
+    const normalizedId = `#${id.replace(/^m/i, "")}`;
+
+    const lastGroup = groups[groups.length - 1];
+
+    if (lastGroup && lastGroup.isManager === isManager) {
+      lastGroup.ids.push(normalizedId);
+    } else {
+      groups.push({
+        isManager,
+        ids: [normalizedId],
+      });
+    }
+  });
+
+  const hraText =
+    "HRA completed via " +
+    groups
+      .map((group, index) => {
+        const source = group.isManager ? "Manager Escalation" : "ID Portal";
+
+        const prefix = index === 0 ? source : `later through ${source}`;
+
+        return `${prefix} ${group.ids.join(", ")}`;
+      })
+      .join(" and ");
+
+  return hraText;
+};
+
+function generateIMSNote() {
+  if (!currentTicket) return "";
+
+  const i = currentTicket.ims || {};
+
+  const prior =
+    i.priorIssue === "Prior"
+      ? "Previous → " + val(i.priorTicketNumber)
+      : val(i.priorIssue);
+  const capitalizeFirst = (text) =>
+    text ? text.charAt(0).toUpperCase() + text.slice(1) : "";
+  const capitalizeWords = (text) => {
+    if (!text) return "";
+
+    return text
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  };
+
+  return [
+    "━━━ 👤 User Information ━━━",
+    "🆔 User ID: " + val(i.userId).toUpperCase(),
+    "🙍 Full Name: " + capitalizeWords(val(i.fullName)),
+    "📞 Contact Number: " + val(i.contact),
+    "🏠 User Type: " + val(i.userType),
+    "",
+    "━━━ 💼 Work Environment ━━━",
+    "🕒 Working Hours & Days: " + val(i.workingHours),
+    "💻 Operating System: " + val(i.os),
+    "🖥️ Device Type: " + val(i.deviceType),
+    "🏷️ Workstation ID: " + val(i.workstationId).toUpperCase(),
+    "",
+    "━━━ ⚠️ Problem Statement ━━━",
+    "🎯 Object: " + capitalizeFirst(val(i.object)),
+    "🔍 Deviation: " + capitalizeFirst(val(i.deviation)),
+    "✅ Last Successful Attempt: " + val(i.lastAttempt),
+    "🆕 New or Previous: " + prior,
+    "",
+    "━━━ ✅ Verification ━━━",
+    hraProcess(val(currentTicket.inc.validationRef)),
+  ].join("\n");
+}
+
+function generateINCNote() {
+  const ticketId = $("ticketId")?.value?.trim()?.toUpperCase() || "";
+  const isExistingINC = ticketId.startsWith("INC");
+  const inc = currentTicket?.inc || {};
+  const ims = currentTicket?.ims || {};
+  const extra = [];
+
+  const headerSections = [];
+
+  // Validation Reference
+  if (!isExistingINC || inc.validationRef?.trim()) {
+    const validationRef = inc.validationRef?.trim() || "";
+
+    headerSections.push(
+      ...sectionHeader("Verification", "✅"),
+      hraProcess(validationRef),
+      "",
+    );
+  }
+
+  // Workstation Details
+  if (!isExistingINC || (ims.deviceType?.trim() && ims.workstationId?.trim())) {
+    headerSections.push(
+      ...sectionHeader("Workstation details", "💻"),
+      `Operating System: ${val(ims.os)}`,
+      `Device Type: ${val(ims.deviceType)}`,
+      `Workstation ID: ${val(ims.workstationId).toUpperCase()}`,
+      "",
+      "",
+    );
+  }
+  const validScanners =
+    inc.scanners?.filter(
+      (scanner) =>
+        scanner.scannerNumber?.trim() || scanner.receiptPrinterNumber?.trim(),
+    ) || [];
+
+  if (inc.showScannerFields && validScanners.length) {
+    if (validScanners.length === 1) {
+      const scanner = validScanners[0];
+
+      const scannerValue = val(scanner.scannerNumber).toUpperCase();
+      const printerValue = val(scanner.receiptPrinterNumber).toUpperCase();
+
+      extra.push(
+        ...sectionHeader("Scanner/Printer Info", "🌐"),
+        `Scanner: ${scannerValue}`,
+        `Printer: ${printerValue}`,
+        "",
+        "",
+      );
+    } else {
+      extra.push(...sectionHeader("Scanner/Printer Info", "🌐"));
+
+      validScanners.forEach((scanner, i) => {
+        const entry = String(i + 1);
+        const scannerValue = val(scanner.scannerNumber).toUpperCase();
+        const printerValue = val(scanner.receiptPrinterNumber).toUpperCase();
+
+        extra.push(
+          `Scanner ${entry}: ${scannerValue}`,
+          `Printer ${entry}: ${printerValue}`,
+          "",
+        );
+      });
+      extra.push("");
+    }
+  }
+  const validPrinters =
+    inc.printers?.filter(
+      (printer) =>
+        printer.makeModel?.trim() ||
+        printer.ip?.trim() ||
+        printer.serial?.trim(),
+    ) || [];
+
+  if (inc.showPrinterFields && validPrinters.length) {
+    if (validPrinters.length === 1) {
+      const printer = validPrinters[0];
+
+      extra.push(
+        ...sectionHeader("Printer Details", "🖨️"),
+        `Make & Model: ${val(printer.makeModel)}`,
+        `IP Address: ${val(printer.ip)}`,
+        `Serial Number: ${val(printer.serial).toUpperCase()}`,
+        "",
+        "",
+      );
+    } else {
+      extra.push(...sectionHeader("Printer Details", "🖨️"));
+
+      validPrinters.forEach((printer) => {
+        const makeModel = val(printer.makeModel);
+        const ip = val(printer.ip);
+        const serial = val(printer.serial).toUpperCase();
+
+        extra.push(
+          `${val(printer.makeModel)}`,
+          `• IP Address: ${val(printer.ip)}`,
+          `• Serial Number: ${val(printer.serial).toUpperCase()}`,
+          "",
+        );
+      });
+      extra.push("");
+    }
+  }
+
+  const validEquipment =
+    inc.equipment?.filter(
+      (device) =>
+        device.type?.trim() ||
+        device.makeModel?.trim() ||
+        device.serial?.trim(),
+    ) || [];
+
+  if (inc.showEquipmentFields && validEquipment.length) {
+    if (validEquipment.length === 1) {
+      const device = validEquipment[0];
+
+      extra.push(
+        ...sectionHeader("Asset Details", "📦"),
+        `${val(device.type)}`,
+        `• Make & Model: ${val(device.makeModel)}`,
+        `• Serial Number: ${val(device.serial)}`,
+        "",
+        "",
+      );
+    } else {
+      extra.push(...sectionHeader("Asset Details", "📦"));
+
+      validEquipment.forEach((device) => {
+        const type = val(device.type);
+        const makeModel = val(device.makeModel);
+        const serial = val(device.serial).toUpperCase();
+
+        extra.push(
+          `${val(device.type)}`,
+          `• Make & Model: ${val(device.makeModel)}`,
+          `• Serial Number: ${val(device.serial)}`,
+          "",
+        );
+      });
+
+      extra.push("");
+    }
+  }
+
+  const status = inc.ticketStatus || "Resolved";
+  let tail = [];
+
+  switch (status) {
+    case "Select Ticket Status":
+      tail = [...getTroubleshootingSection(inc), ""];
+      break;
+    case "Resolved":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Resolution", "✔️"),
+        "Issue resolved successfully.",
+        "TM acknowledged successful resolution and approved ticket closure.",
+      ];
+      break;
+
+    case "Self Resolved":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Resolution", "✔️"),
+        "Issue Self resolved.",
+      ];
+      break;
+
+    case "Information":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Information Provided", "📜"),
+        "Provided TM with the necessary information.",
+      ];
+      break;
+
+    case "Duplicate Ticket":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Resolution", "✔️"),
+        "There was another ticket created for this issue.",
+        "Therefore closing this ticket as a duplicate ticket.",
+      ];
+      break;
+    case "Master Ticket":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Resolution", "✔️"),
+        "There is a known issues going on.",
+        "Therefore attaching this ticket to a master ticket.",
+      ];
+      break;
+    case "Open":
+      {
+        const openReason = inc.openReason || "";
+
+        switch (openReason) {
+          case "Monitoring":
+            tail = [
+              ...getTroubleshootingSection(inc),
+              ...sectionHeader("Resolution", "✔️"),
+              "Issue resolved successfully.",
+              "TM requested to keep the ticket open for monitoring.",
+              "",
+              "Follow-up scheduled to ensure continued stability.",
+            ];
+            break;
+
+          case "Busy":
+            tail = [
+              ...getTroubleshootingSection(inc),
+              ...sectionHeader("Ticket Status", "🎫"),
+              "TM requested to keep the ticket open as they are currently unavailable for troubleshooting.",
+              `Reason: ${val(inc.busyReason)}`,
+              ...(inc.busyNotes?.trim()
+                ? ["Additional Notes:", val(inc.busyNotes)]
+                : []),
+            ];
+            break;
+
+          case "No Response":
+            tail = [
+              ...getTroubleshootingSection(inc),
+              "Call Status",
+              ...sectionHeader("Call Status", "📞"),
+              "TM was not responding.",
+              "Provided 3 strikes and disconnected the call as per TSD procedure.",
+            ];
+            break;
+
+          case "Call Disconnected":
+            tail = [
+              ...getTroubleshootingSection(inc),
+              ...sectionHeader("Call Status", "📞"),
+              "Call disconnected unexpectedly.",
+            ];
+            break;
+
+          case "Callback Requested":
+            tail = [
+              ...getTroubleshootingSection(inc),
+              ...sectionHeader("Call Status", "📞"),
+              "TM requested a callback.",
+            ];
+            break;
+
+          default:
+            tail = [
+              ...getTroubleshootingSection(inc),
+              ...sectionHeader("Ticket Status", "🎫"),
+              "Ticket remains open for further action.",
+            ];
+        }
+
+        break;
+      }
+      break;
+
+    case "WTF - Warm Handoff":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Escalation", "🚨"),
+        "Performing warm handoff for further troubleshooting.",
+      ];
+      break;
+
+    case "WTF - DSV Warm Handoff":
+      const validEquipment =
+        inc.equipment?.filter(
+          (device) =>
+            device.type?.trim() ||
+            device.makeModel?.trim() ||
+            device.serial?.trim(),
+        ) || [];
+      const selectedEquipment = inc.selectedEscalationEquipment?.length
+        ? inc.selectedEscalationEquipment
+            .map((index) => inc.equipment?.[index])
+            .filter(
+              (device) =>
+                device &&
+                (device.type?.trim() ||
+                  device.makeModel?.trim() ||
+                  device.serial?.trim()),
+            )
+        : [];
+
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Escalation", "🚨"),
+        "Performing warm handoff for further troubleshooting.",
+        "",
+      ];
+      if (!validEquipment.length) {
+        tail.push(
+          "Workstation ID: " + val(ims.workstationId).toUpperCase(),
+          "Make & Model: " + val(inc.makeModel),
+          "Contact Number: " + val(ims.contact),
+          "Home Location: " + val(inc.homeAddress),
+          "Office Location: " + val(inc.officeAddress),
+        );
+      } else {
+        tail.push(
+          `${val(ims.deviceType)}`,
+          "• Workstation ID: " + val(ims.workstationId).toUpperCase(),
+          "• Make & Model: " + val(inc.makeModel),
+          "• Contact Number: " + val(ims.contact),
+          "• Home Location: " + val(inc.homeAddress),
+          "• Office Location: " + val(inc.officeAddress),
+          "",
+        );
+
+        if (!selectedEquipment.length) {
+          tail.push("No equipment selected");
+          break;
+        }
+
+        selectedEquipment.forEach((device, i) => {
+          tail.push(
+            `${val(device.type)}`,
+            `• Make & Model: ${val(device.makeModel)}`,
+            `• Serial Number: ${val(device.serial).toUpperCase()}`,
+            "",
+          );
+        });
+      }
+      break;
+
+    case "DSV": {
+      const validEquipment =
+        inc.equipment?.filter(
+          (device) =>
+            device.type?.trim() ||
+            device.makeModel?.trim() ||
+            device.serial?.trim(),
+        ) || [];
+      const selectedEquipment = inc.selectedEscalationEquipment?.length
+        ? inc.selectedEscalationEquipment
+            .map((index) => inc.equipment?.[index])
+            .filter(
+              (device) =>
+                device &&
+                (device.type?.trim() ||
+                  device.makeModel?.trim() ||
+                  device.serial?.trim()),
+            )
+        : [];
+
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Escalation", "🚨"),
+        "Escalating this ticket to DSV Team for further troubleshooting.",
+        "",
+      ];
+
+      if (!validEquipment.length) {
+        tail.push(
+          "Workstation ID: " + val(ims.workstationId).toUpperCase(),
+          "Make & Model: " + val(inc.makeModel),
+          "Contact Number: " + val(ims.contact),
+          "Home Location: " + val(inc.homeAddress),
+          "Office Location: " + val(inc.officeAddress),
+        );
+      } else {
+        tail.push(
+          `${val(ims.deviceType)}`,
+          "• Workstation ID: " + val(ims.workstationId).toUpperCase(),
+          "• Make & Model: " + val(inc.makeModel),
+          "• Contact Number: " + val(ims.contact),
+          "• Home Location: " + val(inc.homeAddress),
+          "• Office Location: " + val(inc.officeAddress),
+          "",
+        );
+
+        if (!selectedEquipment.length) {
+          tail.push("No equipment selected");
+          break;
+        }
+
+        selectedEquipment.forEach((device, i) => {
+          tail.push(
+            `${val(device.type)}`,
+            `• Make & Model: ${val(device.makeModel)}`,
+            `• Serial Number: ${val(device.serial).toUpperCase()}`,
+            "",
+          );
+        });
+      }
+
+      break;
+    }
+    case "Printer Escalate": {
+      const validPrinters =
+        inc.printers?.filter(
+          (printer) =>
+            printer.makeModel?.trim() ||
+            printer.ip?.trim() ||
+            printer.serial?.trim(),
+        ) || [];
+
+      const selectedPrinters = inc.selectedEscalationPrinters?.length
+        ? inc.selectedEscalationPrinters
+            .map((index) => inc.printers?.[index])
+            .filter(
+              (printer) =>
+                printer &&
+                (printer.makeModel?.trim() ||
+                  printer.ip?.trim() ||
+                  printer.serial?.trim()),
+            )
+        : [];
+
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "",
+        ...sectionHeader("Printer Escalation", "🖨️"),
+        "Escalating this to " +
+          val(inc.assignmentGroup, "[Assignment Group]") +
+          " for further troubleshooting.",
+        "",
+      ];
+
+      selectedPrinters.forEach((printer) => {
+        tail.push(
+          `${val(printer.makeModel)}`,
+          `• IP Address: ${val(printer.ip)}`,
+          `• Serial Number: ${val(printer.serial).toUpperCase()}`,
+          "",
+        );
+      });
+
+      tail.push("• Printer Office Address: " + val(inc.printerOfficeLocation));
+
+      break;
+    }
+    case "CRE":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        ...sectionHeader("Escalation", "🚨"),
+        "TM is requesting escalation to higher level team.",
+        "Escalating this to the Remote Support Team",
+        ...(inc.escalationNotes?.trim()
+          ? ["", formatTroubleshooting(inc.escalationNotes)]
+          : []),
+      ];
+      break;
+
+    case "Status":
+      tail = [
+        ...getTroubleshootingSection(inc),
+        "Provided TM with the " + $("priorTicketNumber").value + " status",
+        ...(inc.escalationNotes?.trim()
+          ? ["", formatTroubleshooting(inc.escalationNotes)]
+          : []),
+      ];
+      break;
+
+    default:
+      if (inc.escalationNotes && inc.escalationNotes.trim()) {
+        tail = [
+          ...getTroubleshootingSection(inc),
+          "",
+          ...sectionHeader("Escalation", "🚨"),
+          "Escalating this to " +
+            val(inc.assignmentGroup, "[Assignment Group]") +
+            " for further troubleshooting.",
+          "",
+          formatTroubleshooting(inc.escalationNotes),
+        ];
+      } else {
+        tail = [
+          ...getTroubleshootingSection(inc),
+          "",
+          ...sectionHeader("Escalation", "🚨"),
+          "Escalating this to " +
+            val(inc.assignmentGroup, "[Assignment Group]") +
+            " for further troubleshooting the issue.",
+        ];
+      }
+  }
+
+  return [
+    "━━━ 📌 Incident Summary ━━━",
+    "" + val(inc.issueTitle, "Untitled Incident"),
+    `Multi User: ${val(ims.multiuser, "N/A")}`,
+    "━━━━━━━━━━━━━━━━",
+    "",
+    // "+-- Validation Reference",
+    // "│   └── HRA completed via Form ID Portal #" + val(inc.validationRef),
+    // "│",
+    // "+-- Workstation Details",
+    // "│   ├── Device Type: " + val(ims.deviceType),
+    // "│   └── Workstation ID: " + val(ims.workstationId),
+    // "│",
+    ...headerSections,
+    ...extra,
+    // "├── Issue Reported",
+    // "│   └──" + val(ims.deviation),
+
+    ...tail,
+    "",
+    ...sectionHeader("KB Used", "📖"),
+  ].join("\n");
+}
+
+function getTroubleshootingSection(inc) {
+  const raw = inc.troubleshooting?.trim();
+
+  if (!raw) return [];
+
+  const noTsPattern = /^(\*|#|-)?\s*no\s*ts\b/i;
+  const isNoTS = noTsPattern.test(raw);
+
+  let cleaned = raw;
+
+  if (isNoTS) {
+    cleaned = raw.replace(noTsPattern, "").trim();
+  }
+
+  return [
+    isNoTS
+      ? sectionHeader("Issue Summary", "📌")
+      : sectionHeader("Troubleshooting Performed", "🛠️"),
+    formatTroubleshooting(cleaned),
+    "",
+  ];
+}
+
+function updatePreview() {
+  $("imsPreview").textContent = currentTicket
+    ? generateIMSNote()
+    : "No IMS ticket selected.";
+  $("incPreview").textContent = currentTicket
+    ? generateINCNote()
+    : "No INC ticket selected.";
+  $("resPreview").textContent = currentTicket
+    ? generateResolutionNote()
+    : "No INC ticket selected.";
+}
+
+async function copyIMSNote(btn) {
+  try {
+    await navigator.clipboard.writeText(generateIMSNote());
+    animateButtonSuccess(btn);
+  } catch (err) {
+    console.error(err);
+    animateButtonSuccess(btn, "✗ Failed");
+  }
+}
+
+async function copyINCNote(btn) {
+  try {
+    await navigator.clipboard.writeText(generateINCNote());
+    animateButtonSuccess(btn);
+  } catch {
+    animateButtonSuccess(btn, "✗ Failed");
+  }
+}
+
+async function copyFollowUpNote(btn) {
+  try {
+    syncFollowUpBlocksToState();
+
+    const followUps = currentTicket?.inc?.followUps || [];
+
+    const validFollowUps = followUps
+      .map(normalizeFollowUp)
+      .filter(
+        (f) =>
+          Object.values(f.methods || {}).some((value) => value?.trim()) ||
+          f.actionTaken?.trim(),
+      );
+
+    if (!validFollowUps.length) {
+      return animateButtonSuccess(btn, "No Follow-Up");
+    }
+
+    const latest = validFollowUps[validFollowUps.length - 1];
+
+    const methodLines = followUpMethodNames
+      .filter((method) => latest.methods?.[method]?.trim())
+      .map((method) => `• ${method}: ${latest.methods[method]}`);
+
+    const text = [
+      ...sectionHeader(`Follow-Up Attempt ${validFollowUps.length}`, "🔄"),
+      ...methodLines,
+
+      ...(latest.actionTaken?.trim() ? [latest.actionTaken.trim()] : []),
+
+      "",
+    ].join("\n");
+
+    await navigator.clipboard.writeText(text);
+
+    animateButtonSuccess(btn);
+  } catch {
+    animateButtonSuccess(btn, "✗ Failed");
+  }
+}
+
+async function copyResolution(btn) {
+  try {
+    await navigator.clipboard.writeText(generateResolutionNote());
+    animateButtonSuccess(btn);
+  } catch {
+    animateButtonSuccess(btn, "Copy Failed");
+  }
+}
+
+function getTicketStatusLabel(ticket) {
+  let status = (ticket.inc?.ticketStatus || "Open").trim();
+
+  if (status === "Open" && ticket.inc?.openReason) {
+    status = `Open - ${ticket.inc.openReason}`;
+  }
+
+  return status;
+}
+
+function updatePinCurrentTicketButton() {
+  const btn = $("pinCurrentTicketBtn");
+  if (!btn) return;
+
+  const isPinned = Boolean(currentTicket?.pinned);
+  btn.classList.toggle("is-pinned", isPinned);
+  btn.title = isPinned ? "Unpin ticket" : "Pin ticket";
+  btn.setAttribute("aria-label", isPinned ? "Unpin Ticket" : "Pin Ticket");
+}
+
+function updateSelectedPinnedTicket() {
+  const selectedId = currentTicket?.id || "";
+
+  document.querySelectorAll(".pinned-ticket").forEach((item) => {
+    const isSelected = item.dataset.ticketId === selectedId;
+    item.classList.toggle("is-selected", isSelected);
+    item.setAttribute("aria-current", isSelected ? "true" : "false");
+  });
+}
+
+function hidePinnedTicketMenu() {
+  const menu = $("pinnedTicketMenu");
+  if (!menu) return;
+
+  menu.classList.add("hidden");
+  menu.dataset.ticketId = "";
+}
+
+function showPinnedTicketMenu(ticketId, event) {
+  const menu = $("pinnedTicketMenu");
+  if (!menu) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  menu.dataset.ticketId = ticketId;
+  menu.style.left = `${Math.min(event.clientX, window.innerWidth - 140)}px`;
+  menu.style.top = `${Math.min(event.clientY, window.innerHeight - 60)}px`;
+  menu.classList.remove("hidden");
+}
+
+function isValidTicketId(ticketId) {
+  return /^(IMS|INC)\d+$/i.test(String(ticketId || "").trim());
+}
+
+async function newTicket(btn) {
+  if (!db) return;
+
+  const ticketId = $("ticketId").value.trim().toUpperCase();
+  if (!isValidTicketId(ticketId)) {
+    return showMessage("Enter valid ticket ID first", "error");
+  }
+
+  const currentData = buildTicketData();
+  currentData.pinned = true;
+  await persistTicket(currentData);
+
+  const draftTicket = createRelatedTicketDraft(currentData);
+  await persistTicket(draftTicket, () => {
+    animateButtonSuccess(btn, '<i class="fa-solid fa-check"></i>');
+    showMessage(
+      "Pinned current ticket and started a related ticket.",
+      "success",
+    );
+  });
+  loadTicket(draftTicket);
+}
+
+function createRelatedTicketDraft(data) {
+  const now = new Date().toISOString();
+  const ims = data.ims || {};
+
+  return {
+    id: `DRAFT-${Date.now()}`,
+    ims: {
+      ...ims,
+      object: "",
+      deviation: "",
+    },
+    resolution: {},
+    inc: {
+      validationRef: data.inc?.validationRef || "",
+      ticketStatus: "Set Ticket Status",
+    },
+    createdAt: now,
+    updatedAt: now,
+    pinned: true,
+  };
+}
+
+$("ticketId").addEventListener("blur", handleDraftConversion);
+
+async function handleDraftConversion() {
+  const newTicketId = $("ticketId").value.trim().toUpperCase();
+
+  if (!isValidTicketId(newTicketId)) {
+    return;
+  }
+
+  if (!loadedTicketId?.startsWith("DRAFT-")) {
+    return;
+  }
+
+  const oldDraftId = loadedTicketId;
+  const updatedTicket = buildTicketData();
+  updatedTicket.id = newTicketId;
+
+  const tx = db.transaction(["tickets"], "readwrite");
+  const store = tx.objectStore("tickets");
+
+  store.delete(oldDraftId);
+
+  const encrypted = await encryptRecord(updatedTicket);
+  store.put(encrypted);
+
+  currentTicket = updatedTicket;
+  loadedTicketId = updatedTicket.id;
+
+  tx.oncomplete = () => {
+    loadTickets();
+    loadPinnedTickets();
+    updatePinCurrentTicketButton();
+  };
+}
+
+function toggleCurrentTicketPin(btn) {
+  const ticketId = $("ticketId").value.trim().toUpperCase();
+
+  if (!isValidTicketId(ticketId)) {
+    return showMessage("Enter valid ticket ID first", "error");
+  }
+
+  const data = buildTicketData();
+  data.pinned = !Boolean(currentTicket?.pinned);
+
+  persistTicket(data, () => {
+    updatePinCurrentTicketButton();
+    // animateButtonSuccess(btn, data.pinned ? "Pinned" : "Unpinned");
+  });
+}
+
+function toggleTicketPin(ticketId) {
+  if (!db) return;
+
+  const readTx = db.transaction(["tickets"], "readonly");
+  const req = readTx.objectStore("tickets").get(ticketId);
+
+  req.onsuccess = async () => {
+    const ticket = await decryptRecord(req.result);
+    if (!ticket) return;
+
+    ticket.pinned = !Boolean(ticket.pinned);
+    ticket.updatedAt = new Date().toISOString();
+    const encryptedTicket = await encryptRecord(ticket);
+    const writeTx = db.transaction(["tickets"], "readwrite");
+    writeTx.objectStore("tickets").put(encryptedTicket);
+
+    writeTx.oncomplete = () => {
+      if (currentTicket?.id === ticketId) {
+        currentTicket.pinned = ticket.pinned;
+        updatePinCurrentTicketButton();
+      }
+
+      loadTickets();
+      loadPinnedTickets();
+    };
+  };
+}
+
+function loadPinnedTickets() {
+  if (!db || !$("pinnedTicketsList")) return;
+
+  const req = db
+    .transaction(["tickets"], "readonly")
+    .objectStore("tickets")
+    .getAll();
+
+  req.onsuccess = async () => {
+    const list = $("pinnedTicketsList");
+    const pinnedTickets = (await decryptRecords(req.result || []))
+      .filter((ticket) => ticket.pinned)
+      .sort((a, b) => {
+        const dateA = new Date(a.updatedAt || a.createdAt || 0).getTime();
+        const dateB = new Date(b.updatedAt || b.createdAt || 0).getTime();
+        return dateB - dateA;
+      });
+
+    list.innerHTML = "";
+
+    if (!pinnedTickets.length) {
+      document.body.classList.remove("has-pinned-tickets");
+      return;
+    }
+
+    document.body.classList.add("has-pinned-tickets");
+
+    pinnedTickets.forEach((ticket) => {
+      const item = document.createElement("button");
+      const username = ticket.ims?.fullName || ticket.ims?.userId || "No user";
+      item.type = "button";
+      item.className = "pinned-ticket";
+      item.dataset.ticketId = ticket.id;
+      item.innerHTML = `
+              <span class="pinned-ticket-id">${escapeHtml(ticket.id)}</span>
+              <span class="pinned-ticket-user">${escapeHtml(username)}</span>
+            `;
+      item.onclick = () => loadTicket(ticket);
+      item.ondblclick = (event) => showPinnedTicketMenu(ticket.id, event);
+      item.oncontextmenu = (event) => showPinnedTicketMenu(ticket.id, event);
+      list.appendChild(item);
+    });
+
+    updateSelectedPinnedTicket();
+  };
+}
+
+function loadTickets() {
+  if (!db) return;
+
+  const req = db
+    .transaction(["tickets"], "readonly")
+    .objectStore("tickets")
+    .getAll();
+
+  req.onsuccess = async () => {
+    const list = $("notesList");
+    list.innerHTML = "";
+
+    const q = $("searchBox").value.trim().toUpperCase();
+
+    const filtered = (await decryptRecords(req.result || []))
+      .filter((t) => {
+        const searchableFields = [
+          t.id,
+          t.inc?.issueTitle,
+          t.ims?.userId,
+          t.ims?.fullName,
+          t.ims?.workstationId,
+        ];
+
+        return searchableFields.some((field) =>
+          String(field || "")
+            .toUpperCase()
+            .includes(q),
+        );
+      })
+      .sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+          return a.pinned ? -1 : 1;
+        }
+
+        const dateA = new Date(a.createdAt || a.updatedAt || 0).getTime();
+        const dateB = new Date(b.createdAt || b.updatedAt || 0).getTime();
+        return dateB - dateA;
+      });
+
+    if (!filtered.length) {
+      list.innerHTML =
+        '<div class="small" style="padding:10px;">No tickets found...</div>';
+      return;
+    }
+
+    filtered.forEach((t) => {
+      const status = getTicketStatusLabel(t);
+
+      const d = document.createElement("div");
+      d.className = `ticket-card ${t.pinned ? "is-pinned" : ""}`;
+
+      d.innerHTML = `
+
+            <div class="ticket-header">
+              <h3 class="ticket-id">${escapeHtml(t.id)}</h3>
+              <div class="ticket-card-actions">
+              <button
+                type="button"
+                class="ticket-pin-btn ${t.pinned ? "is-pinned" : ""}"
+                title="${t.pinned ? "Unpin ticket" : "Pin ticket"}"
+                aria-label="${t.pinned ? "Unpin ticket" : "Pin ticket"}"
+              >
+                <i class="fa-solid fa-thumbtack"></i>
+              </button>
+              <button
+                type="button"
+                class="ticket-delete-btn"
+                title="Delete ticket"
+              >
+                <i class="fa-solid fa-trash"></i>
+              </button>
+              </div>
+            </div>
+
+
+            <div class="ticket-title">${escapeHtml(t.inc?.issueTitle || "No Title")}</div>
+
+             <div class="ticket-status ${getStatusClass(status)}">
+          ${escapeHtml(status)}
+        </div>
+
+            <div class="ticket-time">
+              <i class="fa-regular fa-calendar"></i>
+              <span>${formatDisplayDate(t.createdAt || t.updatedAt)}</span>
+            </div>
+
+            `;
+
+      d.onclick = () => {
+        loadTicket(t);
+        $("searchBox").value = t.id;
+        toggleSideDrawer(); // closes drawer after loading
+      };
+      d.querySelector(".ticket-pin-btn").onclick = (event) => {
+        event.stopPropagation();
+        toggleTicketPin(t.id);
+      };
+      d.querySelector(".ticket-delete-btn").onclick = (event) => {
+        event.stopPropagation();
+        if (!confirm(`Delete ticket ${t.id}?`)) return;
+        deleteTicket(t.id);
+      };
+
+      list.appendChild(d);
+    });
+  };
+}
+
+function getStatusClass(status) {
+  const s = status.toLowerCase().trim();
+
+  switch (s) {
+    case "resolved":
+    case "self resolved":
+    case "Status":
+    case "Information":
+      return "status-resolved";
+
+    case "open":
+      return "status-open";
+
+    case "escalate":
+    case "printer escalate":
+    case "wtf - warm handoff":
+    case "wtf - dsv warm handoff":
+    case "dsv":
+    case "cre":
+      return "status-escalate";
+
+    default:
+      return "status-open";
+  }
+}
+
+function formatDisplayDate(timestamp) {
+  if (!timestamp) return "No timestamp";
+
+  const date = new Date(timestamp);
+
+  if (isNaN(date)) return "Invalid date";
+
+  return date.toLocaleString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: true,
+  });
+}
+
+document.addEventListener("click", (e) => {
+  if (!$("pinnedTicketMenu")?.contains(e.target)) {
+    hidePinnedTicketMenu();
+  }
+
+  if (
+    !$("searchBox").contains(e.target) &&
+    !$("notesList").contains(e.target)
+  ) {
+    $("notesList").classList.remove("active");
+  }
+});
+
+$("sideToggleBtn").addEventListener("click", toggleSideDrawer);
+$("templateToggleBtn").addEventListener("click", toggleTemplateDrawer);
+$("sideOverlay").addEventListener("click", closeDrawers);
+$("pinnedTicketUnpinBtn").addEventListener("click", (event) => {
+  event.stopPropagation();
+  const ticketId = $("pinnedTicketMenu")?.dataset.ticketId;
+  hidePinnedTicketMenu();
+  if (ticketId) toggleTicketPin(ticketId);
+});
+
+function loadTicket(t) {
+  currentTicket = t;
+  loadedTicketId = t.id;
+  const i = t.ims || {},
+    inc = t.inc || {};
+  $("ticketId").value = String(t.id || "").startsWith("DRAFT-")
+    ? ""
+    : t.id || "";
+  $("userId").value = i.userId || "";
+  $("fullName").value = i.fullName || "";
+  $("contact").value = i.contact || "";
+  $("userType").value = i.userType || "";
+  $("workingHours").value = i.workingHours || "8AM - 5PM EST & Mon - Fri";
+  $("os").value = i.os || "Windows";
+  $("deviceType").value = i.deviceType || "";
+  $("workstationId").value = i.workstationId || "";
+  $("object").value = i.object || "";
+  $("deviation").value = i.deviation || "";
+  $("lastAttempt").value = i.lastAttempt || "";
+  $("priorIssue").value = i.priorIssue || "New";
+  $("priorTicketNumber").value = i.priorTicketNumber || "";
+  $("multiuser").value = i.multiuser || "";
+  $("issueTitle").value = inc.issueTitle || "";
+  $("validationRef").value = inc.validationRef || "";
+  $("troubleshooting").value = inc.troubleshooting || "";
+  $("ticketStatus").value = inc.ticketStatus || "Resolved";
+  setResolutionData(t.resolution || inc.resolution || {});
+  renderDynamicFields();
+  if (inc.showScannerFields) {
+    if ($("scannerNumber")) {
+      $("scannerNumber").value = inc.scannerNumber || "";
+    }
+
+    if ($("receiptPrinterNumber")) {
+      $("receiptPrinterNumber").value = inc.receiptPrinterNumber || "";
+    }
+  }
+  $("assignmentGroup").value = inc.assignmentGroup || "";
+  $("escalationNotes").value = inc.escalationNotes || "";
+  $("makeModel").value = inc.makeModel || "";
+  // $("printerMakeModel").value = inc.printerMakeModel || "";
+  $("printerOfficeLocation").value = inc.printerOfficeLocation || "";
+  $("homeAddress").value = inc.homeAddress || "";
+  $("officeAddress").value = inc.officeAddress || "";
+  $("openReason").value = inc.openReason || "";
+  updateStatusFields();
+  renderFollowUpFields();
+  togglePriorTicketField();
+  $("incTab").classList.remove("disabled");
+  $("busyReason").value = inc.busyReason || "";
+  $("busyNotes").value = inc.busyNotes || "";
+  refreshCustomSelects();
+  updateIMSRequiredFieldHighlights();
+  updatePinCurrentTicketButton();
+  updateSelectedPinnedTicket();
+  updateCurrentIssueTitle();
+  updateFilledFieldHighlights();
+  updatePreview();
+  updateTemplateSuggestions();
+}
+
+function deleteTicket(id) {
+  const tx = db.transaction(["tickets"], "readwrite");
+  tx.objectStore("tickets").delete(id);
+  tx.oncomplete = () => {
+    if (currentTicket?.id === id) {
+      clearIMSForm();
+    }
+    loadTickets();
+    loadPinnedTickets();
+  };
+}
+
+function clearIMSForm() {
+  currentTicket = null;
+
+  // Clear all text inputs / textareas / selects
+  document.querySelectorAll("input, textarea, select").forEach((el) => {
+    if (el.tagName === "SELECT") {
+      el.value = "";
+    } else {
+      el.value = "";
+    }
+  });
+
+  // Restore intentional defaults
+  $("workingHours").value = "8AM - 5PM EST & Mon - Fri";
+  $("os").value = "Windows";
+  $("priorIssue").value = "New";
+  $("multiuser").value = "";
+  refreshCustomSelects();
+  clearIMSRequiredFieldHighlights();
+  updateStatusFields();
+  renderFollowUpFields();
+
+  // Clear dynamic rendered sections
+  $("dynamicIssueFields").innerHTML = "";
+  $("followUpFields").innerHTML = "";
+  $("printerSelectionList").innerHTML = "";
+  $("equipmentSelectionList").innerHTML = "";
+  $("templateSuggestions").innerHTML = "";
+  setTemplateSuggestionsVisible(false);
+  updateCurrentIssueTitle();
+  updateFilledFieldHighlights();
+
+  // Hide conditional sections
+  $("escalationFields").classList.add("hidden");
+  $("openFields").classList.add("hidden");
+  $("busyFields").classList.add("hidden");
+  $("dsvFields").classList.add("hidden");
+  $("printerEscalationFields").classList.add("hidden");
+
+  // Reset device toggles
+  ["toggleScanner", "togglePrinter", "toggleEquipment"].forEach((id) => {
+    const el = $(id);
+    if (el) el.classList.remove("active");
+  });
+
+  // Reset prior ticket visibility
+  $("priorTicketNumber")?.classList.add("hidden");
+
+  // If you still want IMS-first workflow
+  $("incTab").classList.add("disabled");
+
+  // Reset previews
+  $("imsPreview").textContent = "No IMS ticket selected.";
+  $("incPreview").textContent = "No INC ticket selected.";
+  $("resPreview").textContent = "No INC ticket selected.";
+  updatePinCurrentTicketButton();
+  updateSelectedPinnedTicket();
+
+  // Go back to IMS
+  showTab("ims");
+
+  scrollToTop();
+}
+
+$("priorIssue").addEventListener("change", togglePriorTicketField);
+$("searchBox").addEventListener("input", loadTickets);
+$("templateSuggestions")?.addEventListener(
+  "wheel",
+  (event) => {
+    const container = event.currentTarget;
+    const canScroll = container.scrollHeight > container.clientHeight + 1;
+    if (!canScroll) return;
+
+    const atTop = container.scrollTop <= 0;
+    const atBottom =
+      container.scrollTop + container.clientHeight >=
+      container.scrollHeight - 1;
+    const scrollingUp = event.deltaY < 0;
+    const scrollingDown = event.deltaY > 0;
+    const shouldScrollInside =
+      (scrollingUp && !atTop) || (scrollingDown && !atBottom);
+
+    if (shouldScrollInside) {
+      event.preventDefault();
+      event.stopPropagation();
+      container.scrollTop += event.deltaY;
+    }
+  },
+  { passive: false },
+);
+$("templateSearchBox").addEventListener("input", loadTemplates);
+$("issueTitle").addEventListener("input", renderDynamicFields);
+$("issueTitle").addEventListener("input", updateTemplateSuggestions);
+$("issueTitle").addEventListener("input", updateCurrentIssueTitle);
+$("ticketStatus").addEventListener("change", updateStatusFields);
+$("ticketStatus").addEventListener("change", renderFollowUpFields);
+
+function toggleDeviceSection(type) {
+  if (!currentTicket) return;
+
+  if (!currentTicket.inc) {
+    currentTicket.inc = {};
+  }
+
+  if (type === "scanner") {
+    syncScannerFieldsToState();
+
+    currentTicket.inc.showScannerFields = !currentTicket.inc.showScannerFields;
+  }
+
+  if (type === "printer") {
+    // SAVE existing printer values first
+    syncPrinterBlocksToState();
+
+    currentTicket.inc.showPrinterFields = !currentTicket.inc.showPrinterFields;
+  }
+  if (type === "equipment") {
+    syncEquipmentBlocksToState();
+    currentTicket.inc.showEquipmentFields =
+      !currentTicket.inc.showEquipmentFields;
+  }
+  renderDynamicFields();
+  updatePreview();
+  triggerAutoSave();
+}
+openDB();
+initAutoLock();
+
+// theme
+const themes = [
+  { id: "dark-pro", name: "Dark Pro" },
+  { id: "light-clean", name: "Light" },
+  // { id: "glass", name: "Glass" },
+  // { id: "neon", name: "Neon" },
+  // { id: "purple", name: "Purple" },
+  // { id: "emerald", name: "Emerald" },
+  // { id: "mono", name: "Mono" },
+  // { id: "midnight-red", name: "Red" },
+  // { id: "ocean", name: "Ocean" },
+  // { id: "sunset", name: "Sunset" },
+  // { id: "rose-gold", name: "Rose Gold" },
+  // { id: "arctic", name: "Arctic" },
+  // { id: "matrix", name: "Matrix" },
+  // { id: "dracula", name: "Dracula" },
+  // { id: "github-dark", name: "GitHub" },
+  // { id: "cyberpunk", name: "Cyberpunk" },
+  // { id: "terminal", name: "Terminal" },
+  // { id: "royal-gold", name: "Royal Gold" },
+  // { id: "nord", name: "Nord" },
+  // { id: "slate-mint", name: "Slate Mint" },
+  // { id: "cobalt", name: "Cobalt" },
+  // { id: "ruby-night", name: "Ruby Night" },
+  // { id: "graphite", name: "Graphite" },
+  // { id: "solar", name: "Solar" },
+  // { id: "orchid", name: "Orchid" },
+];
+async function setTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  await setSetting("app-theme", theme);
+  highlightActiveTheme();
+}
+function getActiveTheme() {
+  return getSetting("app-theme", "dark-pro") || "dark-pro";
+}
+function applySavedTheme() {
+  document.documentElement.setAttribute("data-theme", getActiveTheme());
+  highlightActiveTheme();
+}
+function highlightActiveTheme() {
+  const active = getActiveTheme();
+  document
+    .querySelectorAll(".theme-chip")
+    .forEach((btn) =>
+      btn.classList.toggle("active", btn.dataset.theme === active),
+    );
+}
+function initThemeSwitcher() {
+  const wrap = document.getElementById("themeSwitcher");
+  if (!wrap) return;
+  wrap.innerHTML = themes
+    .map(
+      (t) =>
+        `<button class='theme-chip' data-theme='${t.id}' onclick="setTheme('${t.id}')">${t.name}</button>`,
+    )
+    .join("");
+  highlightActiveTheme();
+}
+window.addEventListener("DOMContentLoaded", () => {
+  applySavedTheme();
+  initThemeSwitcher();
+});
+$("themeToggleBtn").addEventListener("click", () => {
+  $("themeSwitcher").classList.toggle("collapsed");
+});
+$("encryptionChangeBtn")?.addEventListener("click", () =>
+  $("securityMenu")?.classList.toggle("collapsed"),
+);
+$("ticketpadUnlockBtn")?.addEventListener("click", submitLockPassword);
+$("ticketpadPasswordInput")?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") submitLockPassword();
+});
+$("ticketpadPasswordConfirmInput")?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") submitLockPassword();
+});
+$("ticketpadRestoreBackupBtn")?.addEventListener("click", () => {
+  $("ticketpadRestoreBackupFile")?.click();
+});
+$("ticketpadRestoreBackupFile")?.addEventListener(
+  "change",
+  importIndexedDBBackup,
+);
+$("securityModalCloseBtn")?.addEventListener("click", closeSecurityModal);
+$("securityModal")?.addEventListener("click", (event) => {
+  if (event.target?.dataset?.securityClose) closeSecurityModal();
+});
+document.addEventListener("keydown", (event) => {
+  if (
+    event.key === "Escape" &&
+    !$("securityModal")?.classList.contains("hidden")
+  ) {
+    closeSecurityModal();
+  }
+});
+$("securityChangePasswordBtn")?.addEventListener(
+  "click",
+  changeEncryptionPassword,
+);
+$("securityLockNowBtn")?.addEventListener("click", () =>
+  lockTicketPad("Locked."),
+);
+
+const Apps = [
+  "bMobile",
+  "CellTrust",
+  "Cisco AnyConnect",
+  "Concur Mobile",
+  "iPad/Tablet",
+  "Jabber",
+  "MiFi/Hotspot",
+  "Mobile Phone",
+  "MobileGuard",
+  "MS Authenticator",
+  "MS Copilot Mobile",
+  "MS InTune/Company Portal Mobile",
+  "MS Outlook Mobile",
+  "MS SharePoint Mobile",
+  "MS Teams Mobile",
+  "MS Visio Mobile",
+  "Remote Desktop Connection (RDP)",
+  "RSA SecurID",
+  "SalesForce Mobile",
+  "TWebmail (Web Mail)",
+  "WealthScape Mobile",
+  "Workday Mobile",
+  "Workplace Reservations Mobile",
+  "Acadia",
+  "Automated Teller Machine (ATM)",
+  "Branch Lightning Scheduler Tool",
+  "BrightSign",
+  "Caring Conversation Guide/MyDay",
+  "Cash Advance Machine (CAM)",
+  "Centralized Fraud Claims (Fraud Portal)",
+  "Check Printer (SourceTech)",
+  "Check Scanner (Digital)",
+  "ClickShare",
+  "Client Central",
+  "Conference Room",
+  "Connectivity",
+  "Currency Counter",
+  "Digital Video Recorder (DVR)",
+  "Enterprise Teller",
+  "Facility",
+  "Multifunction Printer (Lexmark)",
+  "Receipt Printer (Digital)",
+  "Teller Cash Recycler (TCR)",
+  "Truist Printer Manager (TPM)",
+  "Vault",
+  "Wire Payment Initiation (WPI)",
+  "CyberArk",
+  "Enclave",
+  "MS Authenticator",
+  "MS Windows Hello",
+  "Password Self Service Tool (PSST)",
+
+  "Network Account",
+  "RSA SecurID",
+  "SEI Trust 3000",
+  "Temporary Elevated Access (TEA)",
+  "Check Printer (SourceTech)",
+  "Check Scanner (Digital)",
+  "Multifunction Printer (Lexmark)",
+  "Receipt Printer (Digital)",
+  "RightFax",
+  "Truist Printer Manager (TPM)",
+  "Amazon Connect (AWS)",
+  "CCPulse",
+  "Collections 360",
+  "Genesys",
+  "IP Phone",
+  "Jabber",
+  "NICE",
+  "Unified Desktop",
+  "Verint",
+  "Voice Mail",
+  "360T Electronic Trading Platform",
+  "7Zip",
+  "Ab Initio",
+  "Able2Extract",
+  "Acadia",
+  "Account Adjustment Workflow",
+  "Account Analysis",
+  "Accounting Entry System (AES)",
+  "Accounts in View (AIV)",
+  "Aces",
+  "ACH Fraud Control (AFC)",
+  "Acqueon",
+  "Actimize",
+  "Active Directory",
+  "ActiveBatch",
+  "ActOne",
+  "Adobe Acrobat",
+  "Adobe Captivate",
+  "Adobe Creative Cloud",
+  "Adobe Experience Manager",
+  "Adobe Reader",
+  "Adobe Workfront",
+  "Advanced Document Management (ADM)",
+  "Advisor Desktop",
+  "AFCO Direct",
+  "AFCO Passport",
+  "AFP Workbench",
+  "AFS Vision",
+  "Agora",
+  "AIVA BI",
+  "All Transaction File (ATF)",
+  "Alteryx",
+  "Altova XMLSpy",
+  "Amazon Connect (AWS)",
+  "Anaconda",
+  "Android Studio",
+  "Angular",
+  "AnnuityNet",
+  "Anvilogic",
+  "Apache",
+  "Application Lifecycle Management (ALM)",
+  "Archer",
+  "Argus",
+  "Ariba",
+  "ARIS",
+  "Assurant",
+  "AutoIT",
+  "Automated Clearing House (ACH)",
+  "Automated Insurance Finance Sys (AIFS)",
+  "Balto",
+  "Benefits",
+  "BenePay",
+  "BeyondCompare",
+  "BeyondTrust",
+  "Bitlocker",
+  "Black Ice",
+  "Black Knight (BKFS)",
+  "Blackline Reconciliation System",
+  "Blend",
+  "Bloomberg",
+  "BrainShark",
+  "Branch Lightning Scheduler Tool",
+  "BrightSign",
+  "Broadcom",
+  "Brokerage Production Profiles",
+  "Brokerage Work Requests",
+  "Brownbag",
+  "Bruno",
+  "CA Agile Central (Rally)",
+  "CA Workload Automation (CA-ESP)",
+  "Calypso",
+  "Camtasia",
+  "CapitalIQ",
+  "Card Access Request System (CARS)",
+  "Card Inventory Management System (CIMS)",
+  "Careers",
+  "Caring Conversation Guide/MyDay",
+  "Carleton Loan Calculator",
+  "CCPulse",
+  "Centralized Fraud Claims (Fraud Portal)",
+  "Centralized Fraud Ops (CFO)",
+  "ChangeMan",
+  "Check Image Direct",
+  "Check Partner Enterprise (CPE)",
+  "Cibar GTSNet",
+  "Cisco AnyConnect",
+  "Citrix ShareFile",
+  "Clarifire",
+  "Clarity",
+  "Clear",
+  "ClickShare",
+  "Client Assignment System (CAS)",
+  "Client Central",
+  "Client Complaint Report System (CRS/CCS)",
+  "CloudCords",
+  "Cloudera",
+  "CloudFlare",
+  "Cognota",
+  "Collateral 360",
+  "Collateral Management System (CMS)",
+  "Collections 360",
+  "Commercial Automation Workflow (CAW)",
+  "Commercial Fulfillment Workflow (CFWT)",
+  "Commercial Lending Gateway (CLG)",
+  "Compass",
+  "Concentrix",
+  "Concur",
+  "Conductor",
+  "Conduent Lockbox/Imaging",
+  "Confluence",
+  "Construction Loan Control System (CLCS)",
+  "CoreLogic",
+  "CoStar Real Estate Manager",
+  "CounterParty",
+  "Credit Servicing Web Forms",
+  "CrowdStrike",
+  "Crowe Navigator",
+  "CT Lien Solutions",
+  "CTSUtility",
+  "Currency Teller System (CTS)",
+  "Customer Service Application (CSA)",
+  "Customer StrataStation (CSS)",
+  "CyberArk",
+  "Dark Matter",
+  "Data Integration Processor (DIP)",
+  "DBeaver",
+  "DBVisualizer",
+  "DealerTrack (CMS)",
+  "Dealogic Compliance Manager",
+  "Dealspace",
+  "Default Automation Workflow (DAW)",
+  "Deluxe",
+  "Deposit Rate Approval Portal (DRA)",
+  "Depository Trust and Clearing (DTCC)",
+  "Design Manager",
+  "DexCheck",
+  "Digital Admin Hub (DAH)",
+  "Digital Commerce",
+  "Digital Feature Toggle System (DFTS)",
+  "Digital Identity Authentication System (",
+  "Digital Treasury",
+  "Diligent",
+  "Director 7 (OnePass/ICE)",
+  "Director Scripting Bridge",
+  "DocBridge",
+  "Docker",
+  "Document Direct",
+  "Document Tracking System (DTS)",
+  "DocuSign",
+  "DrawIO",
+  "Drui",
+  "Due Diligence Tracker",
+  "DWG TrueView",
+  "Dynatrace",
+  "Easy Lobby",
+  "ECIS Workflow",
+  "Eclipse",
+  "EmBTRUST (EMB)",
+  "Empower",
+  "Enclave",
+  "Encore",
+  "Enterprise Content Gateway (ECMPortal)",
+  "Enterprise Data Lake (EDL)",
+  "Enterprise Performance Management",
+  "Enterprise Skills Assessment",
+  "Enterprise Spend Platform (ESP)",
+  "Enterprise Teller",
+  "Enterprise Transaction Suite (ETS)",
+  "Envestnet",
+  "eOscar",
+  "Epic",
+  "Equifax",
+  "Erwin",
+  "EUC Insight",
+  "Everbridge",
+  "Experian",
+  "Factiva",
+  "FactSet",
+  "Fannie Mae/Freddie Mac",
+  "FastNet",
+  "Fiddler",
+  "Fidelity Brokerage Sys Interface (FBSI)",
+  "Fieldglass",
+  "Figma",
+  "FileNet",
+  "Finance Risk Data Mart (FRDM)",
+  "Financial System Case Management (FSCM)",
+  "Financial Transaction Manager (FTM)",
+  "Finsight",
+  "Firefox",
+  "First Rate",
+  "FirstStrike",
+  "Fiserv",
+  "ForcePoint (DLP)",
+  "FPS Gold",
+  "Fraud Pro",
+  "FraudNet ATO",
+  "Frontline",
+  "Fusion",
+  "Genesys",
+  "Git",
+  "Gnu Image Manipulation (GIMP)",
+  "GoldPoint (CIM)",
+  "GoldTrak Express (GTE)",
+  "Google Chrome",
+  "Google Earth",
+  "Gradle",
+  "Grammarly",
+  "Hadoop",
+  "HCL Domino",
+  "HCL Notes",
+  "Hearsay Social",
+  "Heliaus",
+  "Highspot",
+  "Hive",
+  "HomeBrew",
+  "Hyperion",
+  "IBIS World",
+  "IBM Content Manager on Demand (CMOD)",
+  "IBM Content Navigator (ICN)",
+  "IBM Data Studio",
+  "IBM DB2",
+  "IBM Developer",
+  "IBM iAccess Client Solutions",
+  "IBM MQ",
+  "IBM RAD",
+  "IBM Rational",
+  "IBM Sterling File Gateway",
+  "IBM Tririga (IWMS)",
+  "IBM WebSphere",
+  "Identity and Access Mgmt Portal (IAM)",
+  "IFS Automation",
+  "IIS Express",
+  "ILINX",
+  "ImageRight",
+  "Informatica",
+  "Information Reporting",
+  "Innovis",
+  "Integrated Currency Manager (ICM)",
+  "Integrated Fraud Manager (IFM)",
+  "IntelliJ",
+  "Internal Control Express (ICE)",
+  "Internet Information Service (IIS)",
+  "IT Service Portal (Not Apps or Items)",
+  "iWork Imaging",
+  "Jabber",
+  "Jabra Direct",
+  "Java",
+  "JFrog Artifactory",
+  "Job Allocation Control Scheduler (JACS)",
+  "Jupyter",
+  "KeePass",
+  "Kenna Security",
+  "Kentico",
+  "KPMG Business Traveler",
+  "KTC Desktop",
+  "LaserPro",
+  "Learning/Training",
+  "LeaseWave",
+  "Lending Space",
+  "LexisNexis",
+  "LightStream",
+  "LinkedIn",
+  "Linux",
+  "LoanIQ (LIQ)",
+  "LoanSphere",
+  "LongView",
+  "Loss Mitigation Database",
+  "Mainframe/BlueZone",
+  "March",
+  "Maxon",
+  "MicroFocus",
+  "MicroStrategy",
+  "MiniTab",
+  "Miro",
+  "Moba XTerm",
+  "Mobile Remote Deposit Capture (RDC)",
+  "Monarch",
+  "Money Transfer System (MTS)",
+  "Moodys Credit Lens (MCL)",
+  "Morningstar",
+  "Mortgage Servicing Business App (MSBA)",
+  "Mortgage Servicing ICE (MSP)",
+  "Motivator (Edgesell)",
+  "MS .Net",
+  "MS Access",
+  "MS Authenticator",
+  "MS Azure",
+  "MS ClipChamp",
+  "MS Copilot",
+  "MS Edge",
+  "MS Excel",
+  "MS Forms",
+  "MS InTune/Company Portal",
+  "MS Lists",
+  "MS Loop",
+  "MS MyApps",
+  "MS Office",
+  "MS OneDrive",
+  "MS OneNote",
+  "MS Outlook",
+  "MS Planner",
+  "MS PowerApps",
+  "MS PowerAutomate",
+  "MS PowerBI",
+  "MS PowerPoint",
+  "MS PowerShell",
+  "MS Project",
+  "MS Purview",
+  "MS SharePoint",
+  "MS SQL",
+  "MS Teams",
+  "MS Visio",
+  "MS Visual Studio",
+  "MS Whiteboard",
+  "MS Word",
+  "MuleSoft",
+  "MyPurpose",
+  "MySQL Workbench",
+  "NADA Redirector",
+  "Nationwide Mortgage Licensing (NMLS)",
+  "nCino",
+  "NCP Portal",
+  "NCR",
+  "NetDocuments",
+  "Netezza",
+  "NetScaler",
+  "Nexthink",
+  "NICE",
+  "Nintex",
+  "NodeJS",
+  "NotePad ++",
+  "NumberCruncher",
+  "Offers Portal",
+  "Okta",
+  "One Team Fund (Teammate Relief)",
+  "OneSpan Sign (BEES)",
+  "OneStop (SAP Fiori)",
+  "OneView",
+  "Online Courier (OLC)",
+  "Online Payment Connection (OLPC)",
+  "Open Data Transaction (ODT)",
+  "Open Text Exstream",
+  "OpenJDK",
+  "OpenShift",
+  "OpenSSL",
+  "OpenText Load Runner (VuGen)",
+  "Oracle Client",
+  "Oracle Eloqua",
+  "Oracle Enterprise Manager",
+  "Oracle Financial Services (OFSA)",
+  "Oracle JDeveloper",
+  "Oracle SQL",
+  "Organization Health Index Survey (OHI)",
+  "Origenate/Originate (ePeople)",
+  "Palantir",
+  "Pandia",
+  "PartnerCare",
+  "Password Self Service Tool (PSST)",
+  "Payment Portal",
+  "PDF Factory",
+  "Pega",
+  "Perfecto Mobile",
+  "Personal Data Request Workflow (PDRW)",
+  "PGAdmin",
+  "Phenom",
+  "PolicyTech (PPM)",
+  "Postman",
+  "Precision Lender",
+  "Price Metrix",
+  "PrimeRate",
+  "Promotions Center",
+  "Proofpoint Email Protection",
+  "PropertyPoint",
+  "Protegent",
+  "Protranslate Document Translation",
+  "PuTTY",
+  "PyCharm",
+  "Python",
+  "QlikSense",
+  "QlikView",
+  "Qualtrics Surveys",
+  "Qualys",
+  "Quicken Quickbooks",
+  "Quotes in View (QIV)",
+  "QuoteTrac",
+  "Rally",
+  "RamQuest",
+  "Real Estate Transaction Network (REO)",
+  "RealVNC Viewer",
+  "Recovery Connect",
+  "RecoveryViewer",
+  "Regulation E Tracking System (RETS)",
+  "Remote Desktop Connection (RDP)",
+  "Retail Automation Workflow (RAW)",
+  "Retail Lending Portal",
+  "RightFax",
+  "Riva Insight",
+  "Rogo",
+  "RSA SecurID",
+  "RStudio",
+  "Safari",
+  "Safe Box (MainSoft)",
+  "SafeNet",
+  "Sagitta",
+  "SalesForce",
+  "SAP Accounting and Finance",
+  "SAP BI Business Objects (BOBJ)",
+  "SAP BI LaunchPad",
+  "SAP Governance Risk Compliance (GRC)",
+  "SAP Liquidity Risk Management (LRM)",
+  "SAP Logon GUI",
+  "SAP NetWeaver",
+  "Sapience",
+  "SAS Anti Money Laundering (AML)",
+  "SAS Enterprise Guide",
+  "SAS Forecast Server (SASFS)",
+  "SAS Grid Tools",
+  "ScoutRFP",
+  "Secure Shell Tools (SSH)",
+  "SEI Client Service Management",
+  "SEI Trust 3000",
+  "Seismic",
+  "Server Automation",
+  "ServiceNow",
+  "Shaw Loan System (SSSN)",
+  "Shaw Operations Workbench (OWB)",
+  "Shaw Spectrum",
+  "ShipExec",
+  "Sigma",
+  "Skype",
+  "Slido",
+  "SmartFees",
+  "SmartView",
+  "SnagIt",
+  "Snowflake",
+  "SoapUI",
+  "Software Center (Not Apps)",
+  "SonarQube",
+  "Splunk",
+  "Spring Tool Suite",
+  "SPRINT",
+  "Statement Viewer",
+  "Sticky Notes",
+  "SunView Treasury Manager (SVTM)",
+  "Supervision Compliance Manager (SCM)",
+  "SureFire",
+  "Syndtrak",
+  "T-Recs",
+  "Tableau",
+  "TACACS",
+  "Talend",
+  "Tamale",
+  "Team Foundation Server (TFS)",
+  "Teammate Learning Experience (TLX)",
+  "Temporary Elevated Access (TEA)",
+  "Tempus",
+  "Terraform",
+  "The Source (mytruist.com)",
+  "ThinkCell",
+  "Thomson Reuters",
+  "TiffSurfer",
+  "Time Tracking System (TTS)",
+  "Titus",
+  "Toad",
+  "Touchless Return Item Proc Sys (TRIPS)",
+  "TraxIt",
+  "Truist Box",
+  "Truist Financial Planning",
+  "Truist Momentum (TruMo)",
+  "Truist Payments Hub Operations (TPOT)",
+  "Truist Portfolio View (TPV)",
+  "Truist Reporting Info Exchange (TRIX)",
+  "Truist Store",
+  "TSYS Client Portal",
+  "TSYS Customer Service (TCS)",
+  "TSYS OTIS TS2",
+  "TSYS Rewards Loyalty Platform (TLP)",
+  "TWebmail (Web Mail)",
+  "Unclaimed Property Compliance (UPCS)",
+  "Unified Desktop",
+  "Unified Functional Testing (UFT)",
+  "Unusual Financial Observation (UFO)",
+  "Venafi",
+  "Veracode",
+  "Verint",
+  "VINTek",
+  "Visa Access",
+  "Visa Falcon",
+  "Visa Online",
+  "Visual Studio Code (VS Code)",
+  "VLC Media Player",
+  "VMCSelect",
+  "Wall Street Systems",
+  "WealthScape",
+  "WebEx",
+  "WFM CSR",
+  "WhatsApp",
+  "WinMerge",
+  "WinSCP",
+  "WinZip",
+  "Wire Payment Initiation (WPI)",
+  "WirePro",
+  "WireShark",
+  "Workday",
+  "Workforce Experience (WFX) Dashboard",
+  "Working Capital Reporting Portal (WCRP)",
+  "Workiva",
+  "Workplace Reservations",
+  "WorldShip",
+  "WSSMain",
+  "X9Assist",
+  "XChange (RegEd)",
+  "XCode",
+  "XMatters",
+  "XML Notepad",
+  "XSOAR",
+  "Yarn",
+  "Zelle (ZCCUI)",
+  "Zoom",
+  "ZoomText",
+  "Zscaler",
+];
+
+const RootFixOptions = [
+  "Access",
+  "Browser Troubleshooting",
+  "Changed Settings",
+  "Cleared",
+  "Enabled",
+  "Information Provided",
+  "Installed",
+  "No Action",
+  "Others",
+  "Profile Re-build",
+  "Provided BitLocker Recovery Key",
+  "Provided Emergency Token",
+  "Registered",
+  "Reinstalled",
+  "Re-Mapped",
+  "Repaired",
+  "Requested",
+  "Re-routed to Local IT",
+  "Reset",
+  "Restarted",
+  "Self Resolved",
+  "Setup",
+  "Uninstalled",
+  "Updated",
+  "Unlocked",
+];
+
+const EnvironmentOptions = [
+  "AnyConnect",
+  "Network",
+  "Pin",
+  "Password",
+  "VDI",
+  "Windows",
+  "Citrix",
+  "Mobile",
+  "Thin Client",
+  "Multifunction Printer(Lexmark)",
+  "Check Printer(SourceTech)",
+  "Check Scanner(Digital)",
+  "Receipt Printer(Digital)",
+];
+const PrinterMakeModelOptions = ["Lexmark", "Source Technology"];
+const AssetsTypesOptions = [
+  "Laptop",
+  "Tablet",
+  "Mobile Phone",
+  "Headset",
+  "Docking Station",
+  "Keyboard",
+  "Mouse",
+  "Monitor",
+];
+
+const ImsObjectSupplementalOptions = [
+  "MacOS",
+  "Windows",
+  "Password/Mainframe",
+  "Password/Network",
+  "Peripherals",
+  "Shared Drive",
+  "VDI and Citrix",
+  "Workstation",
+];
+
+const ImsObjectOptions = [...Apps, ...ImsObjectSupplementalOptions];
+
+const DeviationOptions = [
+  "Add Ins",
+  "Add Printer",
+  "Add Scanner",
+  "Admin Rights",
+  "Alarm",
+  "Approvals",
+  "Assignment",
+  "Audio",
+  "Battery",
+  "Binding ID/URL",
+  "Biometrics",
+  "Black Screen",
+  "Blocked",
+  "Blue Screen",
+  "Boot Issue",
+  "Cabling",
+  "Calendar",
+  "Camera",
+  "Capacity",
+  "Carrier",
+  "Certificate",
+  "Check Printer (SourceTech)",
+  "Check Scanner (Digital)",
+  "Clear Cache",
+  "Cloud",
+  "Connectivity/Offline",
+  "CPU",
+  "Data Jack",
+  "Data/File",
+  "Delegates",
+  "Digital Video Recorder (DVR)",
+  "Disconnect",
+  "Disk Space",
+  "Display Settings",
+  "Distribution List",
+  "Docking Station",
+  "Domain",
+  "Encryption",
+  "Error/Account Not Onboarded",
+  "Error/AWS Not Launching",
+  "Error/Balance Transaction",
+  "Error/Balance Transfer",
+  "Error/Cannot Complete Request",
+  "Error/Cannot Find Argo",
+  "Error/Cannot Make Calls",
+  "Error/Cannot Receive Calls",
+  "Error/Cannot Start Desktop",
+  "Error/Cashbox Cannot be Freed",
+  "Error/Cashbox In Use",
+  "Error/Change AUX",
+  "Error/Chromedriver",
+  "Error/Concurrent Connection Limit",
+  "Error/Connection Failed",
+  "Error/Course Credit",
+  "Error/Course Removal",
+  "Error/Credit Card",
+  "Error/Debit Card",
+  "Error/Debit Card PIN",
+  "Error/Digital Signature",
+  "Error/Endpoint Failure",
+  "Error/Exceeded Max Login Attempts",
+  "Error/Gateway Timeout",
+  "Error/Ghost Calls",
+  "Error/ID Verification Scan",
+  "Error/Invalid Broker Type",
+  "Error/Issue Verifying Identity",
+  "Error/Last Item Jammed",
+  "Error/Login Denied",
+  "Error/Login Failed Try Again",
+  "Error/MyDay",
+  "Error/Network Communication",
+  "Error/No Apps or Desktops Available",
+  "Error/No Time Record",
+  "Error/Not Installed Properly",
+  "Error/Omni Channel",
+  "Error/Operator Already Signed On",
+  "Error/Outdated Version",
+  "Error/Override",
+  "Error/Planned Maintenance",
+  "Error/Posture Assessment",
+  "Error/Processing Request",
+  "Error/RACF Profile Not Found",
+  "Error/Reboot Required",
+  "Error/Running Instance",
+  "Error/Safebox",
+  "Error/Scanner Connection",
+  "Error/Session Expired",
+  "Error/Signature Card",
+  "Error/Site Cannot be Reached",
+  "Error/SmartScan",
+  "Error/Trust Relationship",
+  "Error/Unable to Combine",
+  "Error/Unable to Edit",
+  "Error/Unable to Map",
+  "Error/Unapproved Access",
+  "Error/Unknown System",
+  "Ethernet",
+  "External Email",
+  "Facility",
+  "Failed Install",
+  "Favorites",
+  "File Explorer",
+  "File Locked",
+  "Fire/Life/Safety",
+  "Firewall",
+  "Generator",
+  "Hard Drive",
+  "Headset",
+  "Home Page",
+  "How to Order",
+  "How to Use",
+  "HVAC",
+  "Image Quality",
+  "Jam",
+  "JAMF",
+  "Keyboard",
+  "License",
+  "Lost/Stolen",
+  "Maintenance",
+  "Meetings",
+  "Memory",
+  "Microphone",
+  "Missing",
+  "Modem",
+  "Monitor",
+  "Mouse",
+  "Name/Address Change",
+  "New Equipment",
+  "New Install",
+  "New Role/Access",
+  "Other Issue",
+  "Password Expired",
+  "Password Locked",
+  "Password Reset",
+  "Patch/Update",
+  "Phish",
+  "PIN/New Setup",
+  "PIN/Reset",
+  "Power",
+  "Power Strip",
+  "Profile",
+  "Purple Screen",
+  "Queue",
+  "Receipt Printer (Digital)",
+  "Recovery",
+  "Register/InTune",
+  "Reimage",
+  "Reinstall",
+  "Remove Printer",
+  "Remove Role/Access",
+  "Repeat Lockout",
+  "Repeat Password Change",
+  "Replace Equipment",
+  "Restart/Reboot",
+  "Retention",
+  "Return Equipment",
+  "Scan to Email",
+  "Search Bar",
+  "Secure Email",
+  "Secure Print",
+  "Send/Receive",
+  "Settings",
+  "Shared Mailbox",
+  "Signature",
+  "Slow/Freezing/Crashing",
+  "Supplies",
+  "Sync Issue",
+  "Television",
+  "Terminated User",
+  "Time Zone",
+  "Token/Emergency",
+  "Token/New Registration",
+  "Token/Re-Registration",
+  "Token/Replacement",
+  "Unable to Launch/Open",
+  "Unable to Log In/Access",
+  "Unable to Power On",
+  "Unable to Print",
+  "Unable to Scan",
+  "Unavailable",
+  "Uninstall",
+  "Unlock",
+  "Upgrade/Migration",
+  "UPS",
+  "User Account Disabled",
+  "User ID",
+  "Vending",
+  "Version",
+  "Video",
+  "Web Mail",
+  "WiFi",
+  "Workstation Account Disabled",
+  "Workstation ID Missing",
+];
+
+function getUniqueSortedOptions(options) {
+  return [
+    ...new Map(
+      options
+        .filter((item) => item && String(item).trim())
+        .map((item) => [String(item).toLowerCase(), String(item).trim()]),
+    ).values(),
+  ].sort((a, b) => a.localeCompare(b));
+}
+
+function initSearchableCombobox(inputId, options) {
+  const input = $(inputId);
+  const list = $(`${inputId}Options`);
+  if (!input || !list) return;
+
+  const sortedOptions = getUniqueSortedOptions(options);
+  let activeIndex = -1;
+  let visibleOptions = [];
+
+  function hideOptions() {
+    list.classList.add("hidden");
+    input.setAttribute("aria-expanded", "false");
+    activeIndex = -1;
+  }
+
+  function setActiveOption(index) {
+    activeIndex = index;
+    [...list.querySelectorAll(".combobox-option")].forEach((option, i) =>
+      option.classList.toggle("active", i === activeIndex),
+    );
+  }
+
+  function selectOption(value) {
+    input.value = value;
+    hideOptions();
+    triggerAutoSave();
+    updatePreview();
+  }
+
+  function renderOptions() {
+    const query = input.value.trim().toLowerCase();
+    visibleOptions = sortedOptions
+      .filter((option) => option.toLowerCase().includes(query))
+      .slice(0, 30);
+
+    list.innerHTML = "";
+
+    if (!visibleOptions.length) {
+      const emptyOption = document.createElement("div");
+      emptyOption.className = "combobox-option empty";
+      emptyOption.textContent = "No matches found";
+      list.appendChild(emptyOption);
+      input.setAttribute("aria-expanded", "true");
+      list.classList.remove("hidden");
+      return;
+    }
+
+    visibleOptions.forEach((option, index) => {
+      const item = document.createElement("div");
+      item.className = "combobox-option";
+      item.setAttribute("role", "option");
+      item.textContent = option;
+
+      item.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        selectOption(option);
+      });
+
+      item.addEventListener("mouseenter", () => setActiveOption(index));
+      list.appendChild(item);
+    });
+
+    input.setAttribute("aria-expanded", "true");
+    list.classList.remove("hidden");
+    setActiveOption(-1);
+  }
+
+  input.addEventListener("focus", renderOptions);
+  input.addEventListener("input", () => {
+    renderOptions();
+    updatePreview();
+  });
+  input.addEventListener("keydown", (event) => {
+    if (list.classList.contains("hidden")) {
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        renderOptions();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!visibleOptions.length) return;
+      setActiveOption((activeIndex + 1) % visibleOptions.length);
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!visibleOptions.length) return;
+      setActiveOption(
+        activeIndex <= 0 ? visibleOptions.length - 1 : activeIndex - 1,
+      );
+    } else if (event.key === "Enter") {
+      const optionToSelect = visibleOptions[activeIndex] || visibleOptions[0];
+
+      if (optionToSelect) {
+        event.preventDefault();
+        selectOption(optionToSelect);
+      }
+    } else if (event.key === "Escape") {
+      hideOptions();
+    }
+  });
+  input.addEventListener("blur", () => {
+    window.setTimeout(() => {
+      const typedValue = input.value.trim();
+
+      if (
+        typedValue &&
+        visibleOptions.length === 1 &&
+        visibleOptions[0].toLowerCase() !== typedValue.toLowerCase()
+      ) {
+        selectOption(visibleOptions[0]);
+        return;
+      }
+
+      hideOptions();
+    }, 120);
+  });
+}
+
+function initCustomSelect(select) {
+  if (!select || select.dataset.customSelectReady === "true") return;
+
+  const field = document.createElement("div");
+  const button = document.createElement("button");
+  const list = document.createElement("div");
+
+  field.className = "custom-select-field";
+  button.type = "button";
+  button.className = "custom-select-button";
+  list.className = "custom-select-options hidden";
+
+  select.parentNode.insertBefore(field, select);
+  field.appendChild(select);
+  field.appendChild(button);
+  field.appendChild(list);
+  select.dataset.customSelectReady = "true";
+
+  function getSelectedOption() {
+    return select.options[select.selectedIndex] || select.options[0];
+  }
+
+  function syncButton() {
+    const selected = getSelectedOption();
+    const isPlaceholder = !select.value;
+
+    button.textContent = selected?.textContent?.trim() || "Select";
+    field.classList.toggle("placeholder", isPlaceholder);
+    field.classList.toggle("filled-field", !isPlaceholder);
+  }
+
+  function closeOptions() {
+    field.classList.remove("open");
+    list.classList.add("hidden");
+  }
+
+  function openOptions() {
+    renderOptions();
+    field.classList.add("open");
+    list.classList.remove("hidden");
+  }
+
+  function chooseOption(option) {
+    if (option.disabled) return;
+
+    select.value = option.value;
+    syncButton();
+    closeOptions();
+    select.dispatchEvent(new Event("input", { bubbles: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function renderOptions() {
+    list.innerHTML = "";
+
+    [...select.options].forEach((option) => {
+      if (option.disabled && !option.value) return;
+
+      const item = document.createElement("div");
+      item.className = "custom-select-option";
+      item.textContent = option.textContent.trim();
+      item.dataset.value = option.value;
+      item.classList.toggle("selected", option.value === select.value);
+
+      item.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        chooseOption(option);
+      });
+
+      list.appendChild(item);
+    });
+  }
+
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (list.classList.contains("hidden")) {
+      openOptions();
+    } else {
+      closeOptions();
+    }
+  });
+
+  select.addEventListener("change", syncButton);
+  select.addEventListener("input", syncButton);
+  syncButton();
+}
+
+function initCustomSelects(scope = document) {
+  scope.querySelectorAll("select").forEach(initCustomSelect);
+}
+
+function refreshCustomSelects(scope = document) {
+  scope
+    .querySelectorAll("select[data-custom-select-ready='true']")
+    .forEach((select) => {
+      select.dispatchEvent(new Event("input", { bubbles: false }));
+    });
+  updateFilledFieldHighlights(scope);
+}
+
+document.addEventListener("click", (event) => {
+  document.querySelectorAll(".custom-select-field.open").forEach((field) => {
+    if (!field.contains(event.target)) {
+      field.classList.remove("open");
+      field.querySelector(".custom-select-options")?.classList.add("hidden");
+    }
+  });
+});
+
+initSearchableCombobox("object", ImsObjectOptions);
+initSearchableCombobox("deviation", DeviationOptions);
+initSearchableCombobox("resolutionRootFix", RootFixOptions);
+initSearchableCombobox("resolutionApplication", ImsObjectOptions);
+initSearchableCombobox("resolutionEnvironment", EnvironmentOptions);
+function initPrinterMakeModelComboboxes() {
+  document.querySelectorAll(".printer-make[id]").forEach((input) => {
+    if (input.dataset.printerMakeModelReady === "true") return;
+    input.dataset.printerMakeModelReady = "true";
+    initSearchableCombobox(input.id, PrinterMakeModelOptions);
+  });
+}
+function initAssetTypeComboboxes() {
+  document.querySelectorAll(".equipment-type[id]").forEach((input) => {
+    if (input.dataset.assetTypeReady === "true") return;
+    input.dataset.assetTypeReady = "true";
+    initSearchableCombobox(input.id, AssetsTypesOptions);
+  });
+}
+initCustomSelects();
+updateFilledFieldHighlights();
+
+async function imageToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+
+    reader.readAsDataURL(file);
+  });
+}
