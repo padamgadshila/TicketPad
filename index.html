@@ -441,7 +441,23 @@
                   />
                 </div>
 
-                <input id="validationRef" placeholder="Validation Ref #" />
+                <div class="combobox-field">
+                  <input
+                    id="validationRef"
+                    placeholder="Validation #23131"
+                    autocomplete="off"
+                    role="combobox"
+                    aria-autocomplete="list"
+                    aria-expanded="false"
+                    aria-controls="validationRefOptions"
+                  />
+                  <div
+                    id="validationRefOptions"
+                    class="combobox-options hidden"
+                    role="listbox"
+                  ></div>
+                </div>
+
                 <select id="multiuser">
                   <option value="" selected disabled>Multi user</option>
                   <option value="No">No</option>
@@ -506,10 +522,11 @@
                 <textarea
                   spellcheck="true"
                   id="troubleshooting"
-                  oninput="autoResizeTextarea(this)"
+                  oninput="autoResizeTextarea(this) ;validateMin50Characters(this);"
                   placeholder="# Initial Checks&#10;- Took remote access&#10;&#10;# Troubleshooting Steps&#10;- Restarted service&#10;&#10;# Validation&#10;- Confirmed with TM"
                 ></textarea>
-
+                <!-- <div id="troubleshootingCounter" class="char-counter">0 / 50</div> -->
+                <!-- <br> -->
                 <select
                   id="ticketStatus"
                   onchange="
@@ -1200,7 +1217,7 @@
         clearTimeout(autoLockTimer);
         if (!dataCryptoKey) return;
         autoLockTimer = setTimeout(
-          () => lockTicketPad("Auto locked after 15 minutes inactive."),
+          () => lockTicketPad("Auto locked after 30 minutes inactive."),
           DATA_CRYPTO_CONFIG.autoLockMs,
         );
       }
@@ -3913,13 +3930,35 @@
             .replace(/\s+/g, " ")
             .replace(/\b\w/g, (char) => char.toUpperCase());
         };
-
-        return [
+        const userInfo = [];
+        const ProblemStatement = [];
+        const WorkEnvironment = [];
+        userInfo.push(
           "━━━ 👤 User Information ━━━",
           "🆔 User ID: " + val(i.userId).toUpperCase(),
           "🙍 Full Name: " + capitalizeWords(val(i.fullName)),
           "📞 Contact Number: " + val(i.contact),
           "🏠 User Type: " + val(i.userType),
+        );
+        if (i.object || i.deviation) {
+          ProblemStatement.push("━━━ ⚠️ Problem Statement ━━━");
+
+          if (i.object) {
+            ProblemStatement.push(
+              "🎯 Object: " + capitalizeFirst(val(i.object)),
+            );
+          }
+
+          if (i.deviation) {
+            ProblemStatement.push(
+              "🔍 Deviation: " + capitalizeFirst(val(i.deviation)),
+            );
+          }
+
+        }
+
+        return [
+          ...userInfo,
           "",
           "━━━ 💼 Work Environment ━━━",
           "🕒 Working Hours & Days: " + val(i.workingHours),
@@ -3927,9 +3966,7 @@
           "🖥️ Device Type: " + val(i.deviceType),
           "🏷️ Workstation ID: " + val(i.workstationId).toUpperCase(),
           "",
-          "━━━ ⚠️ Problem Statement ━━━",
-          "🎯 Object: " + capitalizeFirst(val(i.object)),
-          "🔍 Deviation: " + capitalizeFirst(val(i.deviation)),
+          ...ProblemStatement,
           "✅ Last Successful Attempt: " + val(i.lastAttempt),
           "🆕 New or Previous: " + prior,
           "",
@@ -3938,6 +3975,35 @@
         ].join("\n");
       }
 
+function validateMin50Characters(textarea, minChars = 50) {
+  const count = textarea.value.replace(/\s/g, "").length;
+
+  textarea.classList.toggle(
+    "min-50-error",
+    count > 0 && count < minChars
+  );
+
+  const counter = $("troubleshootingCounter");
+
+  if (counter) {
+    counter.textContent = `${count} / ${minChars}`;
+
+    counter.classList.toggle(
+      "error",
+      count > 0 && count < minChars
+    );
+
+    counter.classList.toggle(
+      "success",
+      count >= minChars
+    );
+  }
+
+  return count >= minChars;
+}
+$("troubleshooting").addEventListener("input", (e) => {
+  validateMin50Characters(e.target, 50);
+});
       function generateINCNote() {
         const ticketId = $("ticketId")?.value?.trim()?.toUpperCase() || "";
         const isExistingINC = ticketId.startsWith("INC");
@@ -3946,6 +4012,17 @@
         const extra = [];
 
         const headerSections = [];
+        const issueTitle = [];
+
+        if (inc.issueTitle?.trim()) {
+          issueTitle.push(
+            "━━━ 📌 Incident Summary ━━━",
+            "" + val(inc.issueTitle, "Untitled Incident"),
+            `Multiuser: ${val(ims.multiuser, "N/A")}`,
+            "━━━━━━━━━━━━━━━━",
+            "",
+          );
+        }
 
         // Validation Reference
         if (!isExistingINC || inc.validationRef?.trim()) {
@@ -4177,7 +4254,6 @@
                 case "No Response":
                   tail = [
                     ...getTroubleshootingSection(inc),
-                    "Call Status",
                     ...sectionHeader("Call Status", "📞"),
                     "TM was not responding.",
                     "Provided 3 strikes and disconnected the call as per TSD procedure.",
@@ -4442,23 +4518,10 @@
         }
 
         return [
-          "━━━ 📌 Incident Summary ━━━",
-          "" + val(inc.issueTitle, "Untitled Incident"),
-          `Multi User: ${val(ims.multiuser, "N/A")}`,
-          "━━━━━━━━━━━━━━━━",
-          "",
-          // "+-- Validation Reference",
-          // "│   └── HRA completed via Form ID Portal #" + val(inc.validationRef),
-          // "│",
-          // "+-- Workstation Details",
-          // "│   ├── Device Type: " + val(ims.deviceType),
-          // "│   └── Workstation ID: " + val(ims.workstationId),
-          // "│",
+          ...issueTitle,
+
           ...headerSections,
           ...extra,
-          // "├── Issue Reported",
-          // "│   └──" + val(ims.deviation),
-
           ...tail,
           "",
           ...sectionHeader("KB Used", "📖"),
@@ -5950,6 +6013,8 @@
         "Workstation",
       ];
 
+      const validationOptions = ["Done", "Failed"];
+
       const ImsObjectOptions = [...Apps, ...ImsObjectSupplementalOptions];
 
       const DeviationOptions = [
@@ -6277,6 +6342,9 @@
             hideOptions();
           }, 120);
         });
+        input.addEventListener("blur", () => {
+          updateFilledFieldHighlights();
+        });
       }
 
       function initCustomSelect(select) {
@@ -6396,6 +6464,7 @@
 
       initSearchableCombobox("object", ImsObjectOptions);
       initSearchableCombobox("deviation", DeviationOptions);
+      initSearchableCombobox("validationRef", validationOptions);
       initSearchableCombobox("resolutionRootFix", RootFixOptions);
       initSearchableCombobox("resolutionApplication", ImsObjectOptions);
       initSearchableCombobox("resolutionEnvironment", EnvironmentOptions);

@@ -432,14 +432,38 @@ textarea.filled-field,
   color: var(--text-strong);
   box-shadow: inset 4px 0 0 rgba(96, 165, 250, 0.85);
 }
+
+input.min-50-error,
+textarea.min-50-error,
+.custom-select-field.min-50-error .custom-select-button {
+  border-color: rgba(239, 68, 68, 0.8);
+  background: linear-gradient(
+    135deg,
+    rgba(239, 68, 68, 0.14),
+    var(--bg-input)
+  );
+  color: var(--text-strong);
+  box-shadow: inset 4px 0 0 rgba(239, 68, 68, 0.9);
+}
+
 input.ims-required-missing,
 select.ims-required-missing {
   border-color: #ef4444;
-  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22);
+    background: linear-gradient(
+    135deg,
+    rgba(239, 68, 68, 0.14),
+    var(--bg-input)
+  );
+  box-shadow: inset 4px 0 0 rgba(239, 68, 68, 0.9);
 }
 input.ims-required-missing:focus,
 select.ims-required-missing:focus {
   border-color: #ef4444;
+    background: linear-gradient(
+    135deg,
+    rgba(239, 68, 68, 0.14),
+    var(--bg-input)
+  );
   box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.32);
 }
 .combobox-field {
@@ -523,7 +547,7 @@ select.ims-required-missing:focus {
 }
 .custom-select-field.ims-required-missing .custom-select-button {
   border-color: #ef4444;
-  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22);
+  box-shadow: inset 4px 0 0 rgba(239, 68, 68, 0.9);
 }
 .custom-select-field.placeholder .custom-select-button {
   color: var(--text-muted);
@@ -2050,4 +2074,20 @@ h5 {
   margin-top: 15px;
   padding: 8px 16px;
   cursor: pointer;
+}
+
+.char-counter {
+  display: block;
+  margin-top: 6px;
+  font-size: 12px;
+  text-align: right;
+  color: var(--text-muted);
+}
+
+.char-counter.error {
+  color: #ef4444;
+}
+
+.char-counter.success {
+  color: #22c55e;
 }
