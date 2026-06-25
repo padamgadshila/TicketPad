@@ -437,26 +437,20 @@ input.min-50-error,
 textarea.min-50-error,
 .custom-select-field.min-50-error .custom-select-button {
   border-color: rgba(239, 68, 68, 0.8);
-  background: linear-gradient(
-    135deg,
-    rgba(239, 68, 68, 0.14),
-    var(--bg-input)
-  );
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.14), var(--bg-input));
   color: var(--text-strong);
   box-shadow: inset 4px 0 0 rgba(239, 68, 68, 0.9);
 }
 
 input.ims-required-missing,
-select.ims-required-missing {
+select.ims-required-missing,
+textarea.ims-required-missing,
+.custom-select-field.ims-required-missing .custom-select-button {
   border-color: #ef4444;
-    background: linear-gradient(
-    135deg,
-    rgba(239, 68, 68, 0.14),
-    var(--bg-input)
-  );
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.14), var(--bg-input));
   box-shadow: inset 4px 0 0 rgba(239, 68, 68, 0.9);
 }
-input.ims-required-missing:focus,
+/* input.ims-required-missing:focus,
 select.ims-required-missing:focus {
   border-color: #ef4444;
     background: linear-gradient(
@@ -465,7 +459,7 @@ select.ims-required-missing:focus {
     var(--bg-input)
   );
   box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.32);
-}
+} */
 .combobox-field {
   position: relative;
 }
@@ -2076,18 +2070,28 @@ h5 {
   cursor: pointer;
 }
 
-.char-counter {
-  display: block;
-  margin-top: 6px;
-  font-size: 12px;
-  text-align: right;
-  color: var(--text-muted);
+#troubleshooting {
+  margin: 0;
 }
-
-.char-counter.error {
+.char-counter {
+  display: flex;
+  justify-content: flex-end;
+  width: 100%;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: transparent !important; 
+}
+#chara {
+  background: transparent !important;
+  margin: 0; 
+  padding: 0;
+  font-weight: bold;
+}
+#chara.error {
   color: #ef4444;
 }
 
-.char-counter.success {
+#chara.success {
   color: #22c55e;
 }

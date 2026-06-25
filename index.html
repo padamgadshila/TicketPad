@@ -522,11 +522,16 @@
                 <textarea
                   spellcheck="true"
                   id="troubleshooting"
-                  oninput="autoResizeTextarea(this) ;validateMin50Characters(this);"
+                  oninput="
+                    autoResizeTextarea(this);
+                    validateMin50Characters(this);
+                  "
                   placeholder="# Initial Checks&#10;- Took remote access&#10;&#10;# Troubleshooting Steps&#10;- Restarted service&#10;&#10;# Validation&#10;- Confirmed with TM"
                 ></textarea>
-                <!-- <div id="troubleshootingCounter" class="char-counter">0 / 50</div> -->
-                <!-- <br> -->
+                <div id="troubleshootingCounter" class="char-counter">
+                  <p id="chara">0 / 50</p>
+                </div>
+
                 <select
                   id="ticketStatus"
                   onchange="
@@ -567,7 +572,8 @@
                     "
                   >
                     <option value="" selected disabled>Select reason</option>
-                    <option>Monitoring</option>
+                    <option>Resolved but open</option>
+                    <option>Pending TS</option>
                     <option>Busy</option>
                     <option>No Response</option>
                     <option>Call Disconnected</option>
@@ -746,6 +752,15 @@
         "os",
         "lastAttempt",
         "priorIssue",
+        "resolutionRootFix",
+        "resolutionApplication",
+        "resolutionEnvironment",
+        "assignmentGroup",
+        "escalationNotes",
+        "makeModel",
+        "homeAddress",
+        "officeAddress",
+        "printerOfficeLocation",
       ];
       /* ==========================================================
    CORE HELPERS
@@ -826,34 +841,54 @@
           }
         });
       }
+function toggleFieldHighlight(el, missing) {
+    el.classList.toggle("ims-required-missing", missing);
+    el.closest(".custom-select-field")?.classList.toggle("ims-required-missing", missing);
+    el.setAttribute("aria-invalid", String(missing));
+}
 
-      function updateIMSRequiredFieldHighlights() {
-        imsRequiredFieldIds.forEach((id) => {
-          const el = $(id);
-          if (!el) return;
+function updateIMSRequiredFieldHighlights() {
+    // 1. Handle your classic static fields by ID
+    imsRequiredFieldIds.forEach((id) => {
+      const el = $(id);
+      if (!el) return;
+      
+      const missing = !String(el.value || "").trim();
+      toggleFieldHighlight(el, missing);
+    });
 
-          const missing = !String(el.value || "").trim();
-          el.classList.toggle("ims-required-missing", missing);
-          el.closest(".custom-select-field")?.classList.toggle(
-            "ims-required-missing",
-            missing,
-          );
-          el.setAttribute("aria-invalid", String(missing));
-        });
-      }
+    // 2. Handle dynamic fields by class
+    const dynamicFields = document.querySelectorAll(".scanner-number, .receipt-printer-number,.printer-make, .printer-ip, .printer-serial, .equipment-serial, .equipment-type, .equipment-make");
+    
+    dynamicFields.forEach((el) => {
+      const missing = !String(el.value || "").trim();
+      toggleFieldHighlight(el, missing);
+    });
+}
 
-      function clearIMSRequiredFieldHighlights() {
-        imsRequiredFieldIds.forEach((id) => {
-          const el = $(id);
-          if (!el) return;
+function clearIMSRequiredFieldHighlights() {
+  // 1. Clear classic static fields by ID
+  imsRequiredFieldIds.forEach((id) => {
+    const el = $(id);
+    if (el) resetFieldState(el);
+  });
 
-          el.classList.remove("ims-required-missing");
-          el.closest(".custom-select-field")?.classList.remove(
-            "ims-required-missing",
-          );
-          el.removeAttribute("aria-invalid");
-        });
-      }
+  // 2. Clear dynamic fields by class
+  const dynamicFields = document.querySelectorAll(
+    ".scanner-number, .receipt-printer-number, .printer-make, .printer-ip, .printer-serial, .equipment-serial, .equipment-type, .equipment-make"
+  );
+
+  dynamicFields.forEach((el) => {
+    resetFieldState(el);
+  });
+}
+
+// Keep it clean with a localized helper function
+function resetFieldState(el) {
+  el.classList.remove("ims-required-missing");
+  el.closest(".custom-select-field")?.classList.remove("ims-required-missing");
+  el.removeAttribute("aria-invalid");
+}
 
       /* ==========================================================
    AUTO SAVE
@@ -2156,6 +2191,7 @@
           updateCurrentIssueTitle();
           updateFilledFieldHighlights();
           updatePreview();
+           validateMin50Characters($("troubleshooting"));
           // showMessage("Template applied", "success");
         };
       }
@@ -2434,26 +2470,6 @@
         };
       }
 
-      /* ==========================================================
-   IMS
-   ========================================================== */
-
-      /* ==========================================================
-   INCIDENTS
-   ========================================================== */
-
-      /* ==========================================================
-   RESOLUTION
-   ========================================================== */
-
-      /* ==========================================================
-   DYNAMIC DEVICES
-   ========================================================== */
-
-      /* ----------------------------------------------------------
-   SCANNERS
-   ---------------------------------------------------------- */
-
       function renderScannerBlocks() {
         const savedScanners = currentTicket?.inc?.scanners;
 
@@ -2559,6 +2575,7 @@
         renderDynamicFields();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights()
       }
 
       function addScannerBlock() {
@@ -2582,6 +2599,7 @@
         renderDynamicFields();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights();
       }
 
       function syncScannerFieldsToState() {
@@ -2720,6 +2738,7 @@
         refreshDynamicEscalationLists();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights()
       }
 
       function removePrinterBlock(index) {
@@ -2743,6 +2762,7 @@
         refreshDynamicEscalationLists();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights()
       }
 
       function renderPrinterSelectionList() {
@@ -2897,7 +2917,7 @@
                  class="add-btn"
                  onclick="addEquipmentBlock()"
                >
-                 + Add Device
+                 + Add Asset
                </button>
              `;
       }
@@ -2941,6 +2961,7 @@
         refreshDynamicEscalationLists();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights()
       }
 
       function removeEquipmentBlock(index) {
@@ -2964,6 +2985,7 @@
         refreshDynamicEscalationLists();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights()
       }
 
       function renderEquipmentSelectionList() {
@@ -3148,6 +3170,10 @@
           status === "Information" ||
           status === "Status";
         $("resolutionPanel").classList.toggle("hidden", !showResolution);
+
+        if(showResolution) {
+          updateIMSRequiredFieldHighlights();
+        }
 
         autoResizeTicketTextareas();
       }
@@ -3433,22 +3459,6 @@
         triggerAutoSave();
       }
 
-      /* ==========================================================
-   NOTE GENERATORS
-   ========================================================== */
-
-      /* ==========================================================
-   COPY FUNCTIONS
-   ========================================================== */
-
-      /* ==========================================================
-   PREVIEW
-   ========================================================== */
-
-      /* ==========================================================
-   STARTUP
-   ========================================================== */
-
       function autoResizeTextarea(el) {
         if (!el) return;
 
@@ -3497,6 +3507,8 @@
       }
 
       function generateResolutionNote() {
+        const raw = $("troubleshooting").value?.trim();
+        if (!raw) return "";
         const resolution = getResolutionData();
         const header = [
           resolution.rootfix,
@@ -3505,11 +3517,21 @@
         ]
           .filter((v) => v && v.trim())
           .join(" - ");
-        return [
-          header,
-          "",
-          formatTroubleshooting($("troubleshooting").value),
-        ].join("\n");
+
+        const noTsPattern = /^(\*|#|-)?\s*no\s*ts\b/i;
+        const isNoTS = noTsPattern.test(raw);
+
+        let cleaned = raw;
+
+        if (isNoTS) {
+          cleaned = raw.replace(noTsPattern, "").trim();
+        }
+if (!cleaned) {
+    return header;
+  }
+
+  const formattedBody = formatTroubleshooting(cleaned);
+        return [header, "", formattedBody].join("\n");
       }
 
       document.addEventListener("input", (e) => {
@@ -3649,18 +3671,19 @@
           // section heading
           if (line.startsWith("#")) {
             const heading = line.replace(/^#+\s*/, "").trim();
-
             output.push(heading, "-".repeat(heading.length));
-
             continue;
           }
 
           // cleanup bullets / arrows / dots
-          let clean = line.replace(/^(\-+>|->|[-.•]+)\s*/, "").trim();
+          let clean = line.replace(/^([-•.>]+|[-•.]+>)\s*/, "").trim();
 
           // capitalize first letter
           if (clean.length) {
             clean = clean.charAt(0).toUpperCase() + clean.slice(1);
+          } else {
+            // If the line was ONLY spam (e.g., ">>>>"), skip adding a blank bullet point
+            continue;
           }
 
           // add punctuation if missing
@@ -3954,7 +3977,6 @@
               "🔍 Deviation: " + capitalizeFirst(val(i.deviation)),
             );
           }
-
         }
 
         return [
@@ -3975,35 +3997,32 @@
         ].join("\n");
       }
 
-function validateMin50Characters(textarea, minChars = 50) {
-  const count = textarea.value.replace(/\s/g, "").length;
+      function validateMin50Characters(textarea, minChars = 50) {
+        const cleanValue = textarea.value.replace(/[-.>\s]/g, "");
+        const count = cleanValue.length;
 
-  textarea.classList.toggle(
-    "min-50-error",
-    count > 0 && count < minChars
-  );
+        textarea.classList.toggle(
+          "min-50-error",
+          count > 0 && count < minChars,
+        );
 
-  const counter = $("troubleshootingCounter");
+        const counter = $("troubleshootingCounter");
 
-  if (counter) {
-    counter.textContent = `${count} / ${minChars}`;
+        if (counter) {
+          counter.innerHTML = `
+    <p id="chara">${count} / ${minChars}</p>
+    `;
 
-    counter.classList.toggle(
-      "error",
-      count > 0 && count < minChars
-    );
+          $("chara").classList.toggle("error", count > 0 && count < minChars);
 
-    counter.classList.toggle(
-      "success",
-      count >= minChars
-    );
-  }
+          $("chara").classList.toggle("success", count >= minChars);
+        }
+        return count >= minChars;
+      }
 
-  return count >= minChars;
-}
-$("troubleshooting").addEventListener("input", (e) => {
-  validateMin50Characters(e.target, 50);
-});
+      $("troubleshooting").addEventListener("input", (e) => {
+        validateMin50Characters(e.target, 50);
+      });
       function generateINCNote() {
         const ticketId = $("ticketId")?.value?.trim()?.toUpperCase() || "";
         const isExistingINC = ticketId.startsWith("INC");
@@ -4228,16 +4247,23 @@ $("troubleshooting").addEventListener("input", (e) => {
               const openReason = inc.openReason || "";
 
               switch (openReason) {
-                case "Monitoring":
+                case "Resolved but open":
                   tail = [
                     ...getTroubleshootingSection(inc),
                     ...sectionHeader("Resolution", "✔️"),
                     "Issue resolved successfully.",
                     "TM requested to keep the ticket open for monitoring.",
-                    "",
-                    "Follow-up scheduled to ensure continued stability.",
                   ];
                   break;
+
+                  case "Pending TS":
+  tail = [
+    ...getTroubleshootingSection(inc),
+    ...sectionHeader("Ticket Status", "🎫"),
+    "Troubleshooting is still in progress.",
+    "Ticket remains open while additional troubleshooting is being performed.",
+  ];
+  break;
 
                 case "Busy":
                   tail = [
@@ -4607,13 +4633,10 @@ $("troubleshooting").addEventListener("input", (e) => {
             .map((method) => `• ${method}: ${latest.methods[method]}`);
 
           const text = [
-            ...sectionHeader(
-              `Follow-Up Attempt ${validFollowUps.length}`,
-              "🔄",
-            ),
+            `Attempt ${validFollowUps.length}`,
             ...methodLines,
-
-            ...(latest.actionTaken?.trim() ? [latest.actionTaken.trim()] : []),
+          "",
+            ...(formatTroubleshooting(latest.actionTaken)?.trim() ? [formatTroubleshooting(latest.actionTaken).trim()] : []),
 
             "",
           ].join("\n");
@@ -4630,6 +4653,9 @@ $("troubleshooting").addEventListener("input", (e) => {
         try {
           await navigator.clipboard.writeText(generateResolutionNote());
           animateButtonSuccess(btn);
+          if($("troubleshooting").value.trim().length < 50) {
+            alert("Troubleshooting notes are less than 50 characters. Please ensure sufficient details are provided.", "warning");
+          }
         } catch {
           animateButtonSuccess(btn, "Copy Failed");
         }
@@ -5100,6 +5126,7 @@ $("troubleshooting").addEventListener("input", (e) => {
         updateFilledFieldHighlights();
         updatePreview();
         updateTemplateSuggestions();
+        validateMin50Characters($("troubleshooting"));
       }
 
       function deleteTicket(id) {
@@ -5240,6 +5267,8 @@ $("troubleshooting").addEventListener("input", (e) => {
         renderDynamicFields();
         updatePreview();
         triggerAutoSave();
+        updateFilledFieldHighlights()
+        
       }
       openDB();
       initAutoLock();
